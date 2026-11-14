@@ -234,6 +234,7 @@ static bool find_child(const Bytes& b, const Box& parent, const char* type, Box&
 struct Track {
     uint32_t scheme = 0;
     uint8_t kid[16] = {0}; uint8_t iv_size = 8; uint8_t crypt = 0, skip = 0; Bytes const_iv; bool protected_ = false;
+    std::map<uint32_t, bool> sample_protection;
     bool video = false; int w = 0, h = 0; Bytes avcc; uint8_t profile_idc = 100;
 };
 static std::map<std::string, Track> g_tracks;
@@ -248,8 +249,9 @@ static bool process_init(Bytes& b, Track& t) {
         if (!strcmp(trak.type, "trak")) {
             Box mdia, minf, stbl, stsd;
             if (find_child(b, trak, "mdia", mdia) && find_child(b, mdia, "minf", minf) && find_child(b, minf, "stbl", stbl) && find_child(b, stbl, "stsd", stsd)) {
-                size_t epos = stsd.off + stsd.hdr + 8, eend = stsd.off + stsd.size; Box ent;
+                size_t epos = stsd.off + stsd.hdr + 8, eend = stsd.off + stsd.size; Box ent; uint32_t description = 0;
                 while (next_box(b, epos, eend, ent)) {
+                    ++description; bool encrypted_entry = !strcmp(ent.type, "encv") || !strcmp(ent.type, "enca");
                     if (!strcmp(ent.type, "encv") || !strcmp(ent.type, "enca")) {
 
                         size_t fields = !strcmp(ent.type, "encv") ? 78 : 28; size_t cpos = ent.off + ent.hdr + fields, cend = ent.off + ent.size; Box sinf;
@@ -273,6 +275,7 @@ static bool process_init(Bytes& b, Track& t) {
                             cpos = sinf.off + sinf.size;
                         }
                     }
+                    t.sample_protection[description] = encrypted_entry;
                     epos = ent.off + ent.size;
                 }
             }
@@ -325,6 +328,30 @@ static bool vdec_init(const Track& t, std::string& err) {
     if (st != cdm::kSuccess) { err = "InitializeVideoDecoder status " + std::to_string((int)st); return false; }
     return true;
 }
+// PIFF carries the same per-sample encryption table in a UUID box.
+static const uint8_t PIFF_SENC_UUID[16] = {0xa2,0x39,0x4f,0x52,0x5a,0x9b,0x4f,0x14,0xa2,0x44,0x6c,0x42,0x7c,0x64,0x8d,0xf4};
+static bool find_piff_senc(const Bytes& b, const Box& traf, Box& out) {
+    size_t pos = traf.off + traf.hdr; Box child;
+    while (next_box(b, pos, traf.off + traf.size, child)) {
+        if (!strcmp(child.type, "uuid") && child.size >= child.hdr + 16 &&
+            !memcmp(&b[child.off + child.hdr], PIFF_SENC_UUID, 16)) { out = child; return true; }
+        pos = child.off + child.size;
+    }
+    return false;
+}
+static std::string fragment_boxes(const Bytes& b, const Box& traf) {
+    std::string result; size_t pos = traf.off + traf.hdr; Box child;
+    while (next_box(b, pos, traf.off + traf.size, child)) {
+        if (!result.empty()) result += ",";
+        result += child.type;
+        if (!strcmp(child.type, "uuid") && child.size >= child.hdr + 16) {
+            result += ":"; char hex[3];
+            for (size_t i = 0; i < 16; ++i) { snprintf(hex, sizeof hex, "%02x", b[child.off + child.hdr + i]); result += hex; }
+        }
+        pos = child.off + child.size;
+    }
+    return result;
+}
 struct SampleEnc { Bytes iv; std::vector<cdm::SubsampleEntry> subs; };
 struct VRange { size_t from = 0, maxn = (size_t)-1, next = 0; bool partial = false; };
 static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes* frames = nullptr, VRange* vr = nullptr, uint64_t file_offset = 0, bool strict = false) {
@@ -338,35 +365,73 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
                 Box tfhd, trun, senc, saiz, saio;
                 if (!find_child(seg, traf, "tfhd", tfhd) || !find_child(seg, traf, "trun", trun)) { tpos = traf.off + traf.size; continue; }
 
-                const uint8_t* th = &seg[tfhd.off + tfhd.hdr]; uint32_t tf = rd32(th) & 0xffffff; size_t o = 8; int64_t base_off = (int64_t)moof_off; uint32_t def_size = 0;
-                if (tf & 1) { uint64_t absolute = rd64(th + o); if (absolute > INT64_MAX || file_offset > INT64_MAX) { err = "invalid fragment base offset"; return false; } base_off = (int64_t)absolute - (int64_t)file_offset; o += 8; } if (tf & 2) o += 4; if (tf & 8) o += 4; if (tf & 0x10) { def_size = rd32(th + o); o += 4; } if (tf & 0x20) o += 4;
+                const uint8_t* th = &seg[tfhd.off + tfhd.hdr]; uint32_t tf = rd32(th) & 0xffffff; size_t o = 8; int64_t base_off = (int64_t)moof_off; uint32_t def_size = 0, description = 0;
+                Track crypto = t;
+                if (tf & 1) { uint64_t absolute = rd64(th + o); if (absolute > INT64_MAX || file_offset > INT64_MAX) { err = "invalid fragment base offset"; return false; } base_off = (int64_t)absolute - (int64_t)file_offset; o += 8; } if (tf & 2) { description = rd32(th + o); o += 4; } if (tf & 8) o += 4; if (tf & 0x10) { def_size = rd32(th + o); o += 4; } if (tf & 0x20) o += 4;
 
                 const uint8_t* tr = &seg[trun.off + trun.hdr]; uint32_t rf = rd32(tr) & 0xffffff; uint32_t cnt = rd32(tr + 4); size_t ro = 8; int32_t data_off = 0;
                 if (rf & 1) { data_off = (int32_t)rd32(tr + ro); ro += 4; } if (rf & 4) ro += 4;
                 std::vector<uint32_t> sizes(cnt);
                 for (uint32_t i = 0; i < cnt; i++) { if (rf & 0x100) ro += 4; if (rf & 0x200) { sizes[i] = rd32(tr + ro); ro += 4; } else sizes[i] = def_size; if (rf & 0x400) ro += 4; if (rf & 0x800) ro += 4; }
 
+                // A traf with no samples needs no per-sample encryption table.
+                if (!cnt) { tpos = traf.off + traf.size; continue; }
+                bool declared_clear = strict && (tf & 2) && t.sample_protection.count(description) && !t.sample_protection.at(description);
                 std::vector<SampleEnc> encs(cnt);
                 bool have_senc = find_child(seg, traf, "senc", senc);
-                if (have_senc) {
-                    const uint8_t* s = &seg[senc.off + senc.hdr]; uint32_t sf = rd32(s) & 0xffffff; uint32_t n = rd32(s + 4); size_t so = 8; bool use_sub = sf & 2;
-                    for (uint32_t i = 0; i < n && i < cnt; i++) {
-                        if (t.iv_size) { encs[i].iv.assign(s + so, s + so + t.iv_size); so += t.iv_size; }
-                        if (use_sub) { uint16_t sc = (s[so] << 8) | s[so + 1]; so += 2; for (uint16_t k = 0; k < sc; k++) { cdm::SubsampleEntry e; e.clear_bytes = (s[so] << 8) | s[so + 1]; e.cipher_bytes = rd32(s + so + 2); so += 6; encs[i].subs.push_back(e); } }
+                bool piff = !have_senc && find_piff_senc(seg, traf, senc);
+                if (have_senc || piff) {
+                    size_t at = senc.off + senc.hdr + (piff ? 16 : 0), end = senc.off + senc.size;
+                    auto need = [&](size_t n) { return at <= end && n <= end - at; };
+                    if (!need(4)) { err = "truncated sample encryption header"; return false; }
+                    uint32_t vf = rd32(&seg[at]), sf = vf & 0xffffff; at += 4;
+                    if ((vf >> 24) || (sf & ~3u)) { err = "unsupported sample encryption flags"; return false; }
+                    bool clear = false;
+                    if (sf & 1) {
+                        if (!need(20)) { err = "truncated encryption override"; return false; }
+                        uint32_t algorithm = ((uint32_t)seg[at] << 16) | ((uint32_t)seg[at+1] << 8) | seg[at+2];
+                        crypto.iv_size = seg[at+3]; memcpy(crypto.kid, &seg[at+4], 16); at += 20;
+                        if (algorithm > 2) { err = "unsupported PIFF encryption algorithm"; return false; }
+                        clear = algorithm == 0;
+                        crypto.scheme = algorithm == 2 ? 0x63626373 : 0x63656e63;
+                        crypto.const_iv.clear(); crypto.crypt = crypto.skip = 0;
+                    }
+                    if ((!clear && crypto.protected_ && crypto.iv_size != 8 && crypto.iv_size != 16 &&
+                         !(crypto.iv_size == 0 && !crypto.const_iv.empty())) || !need(4)) {
+                        err = "invalid sample encryption IV size"; return false;
+                    }
+                    uint32_t n = rd32(&seg[at]); at += 4;
+                    if (n != cnt) { err = "sample encryption count mismatch"; return false; }
+                    for (uint32_t i = 0; i < cnt; i++) {
+                        if (!need(crypto.iv_size)) { err = "truncated sample IV"; return false; }
+                        encs[i].iv.assign(seg.begin() + at, seg.begin() + at + crypto.iv_size); at += crypto.iv_size;
+                        if (sf & 2) {
+                            if (!need(2)) { err = "truncated subsample count"; return false; }
+                            uint16_t count = (seg[at] << 8) | seg[at+1]; at += 2;
+                            if (!need((size_t)count * 6)) { err = "truncated subsample encryption"; return false; }
+                            for (uint16_t k = 0; k < count; k++) {
+                                cdm::SubsampleEntry e; e.clear_bytes = (seg[at] << 8) | seg[at+1];
+                                e.cipher_bytes = rd32(&seg[at+2]); at += 6; encs[i].subs.push_back(e);
+                            }
+                        }
                     }
                     memcpy(&seg[senc.off + 4], "free", 4);
+                    if (find_child(seg, traf, "saiz", saiz)) memcpy(&seg[saiz.off + 4], "free", 4);
+                    if (find_child(seg, traf, "saio", saio)) memcpy(&seg[saio.off + 4], "free", 4);
+                    if (clear) { tpos = traf.off + traf.size; continue; }
                 } else if (find_child(seg, traf, "saiz", saiz) && find_child(seg, traf, "saio", saio)) {
                     const uint8_t* zi = &seg[saiz.off + saiz.hdr]; uint32_t zf = rd32(zi) & 0xffffff; size_t zo = 4; if (zf & 1) zo += 8; uint8_t def = zi[zo]; uint32_t zc = rd32(zi + zo + 1); const uint8_t* per = zi + zo + 5;
                     const uint8_t* oi = &seg[saio.off + saio.hdr]; uint8_t ov = oi[0]; uint32_t of = rd32(oi) & 0xffffff; size_t oo = 4; if (of & 1) oo += 8; uint32_t oc = rd32(oi + oo); oo += 4;
                     uint64_t aux = ov ? rd64(oi + oo) : rd32(oi + oo); size_t so = moof_off + aux; (void)oc;
                     for (uint32_t i = 0; i < zc && i < cnt; i++) {
                         uint32_t isz = def ? def : per[i]; size_t start = so;
-                        if (t.iv_size) { encs[i].iv.assign(&seg[so], &seg[so] + t.iv_size); so += t.iv_size; }
-                        if (isz > (uint32_t)t.iv_size) { uint16_t sc = (seg[so] << 8) | seg[so + 1]; so += 2; for (uint16_t k = 0; k < sc; k++) { cdm::SubsampleEntry e; e.clear_bytes = (seg[so] << 8) | seg[so + 1]; e.cipher_bytes = rd32(&seg[so + 2]); so += 6; encs[i].subs.push_back(e); } }
+                        if (crypto.iv_size) { encs[i].iv.assign(&seg[so], &seg[so] + crypto.iv_size); so += crypto.iv_size; }
+                        if (isz > (uint32_t)crypto.iv_size) { uint16_t sc = (seg[so] << 8) | seg[so + 1]; so += 2; for (uint16_t k = 0; k < sc; k++) { cdm::SubsampleEntry e; e.clear_bytes = (seg[so] << 8) | seg[so + 1]; e.cipher_bytes = rd32(&seg[so + 2]); so += 6; encs[i].subs.push_back(e); } }
                         so = start + isz;
                     }
                     memcpy(&seg[saiz.off + 4], "free", 4); memcpy(&seg[saio.off + 4], "free", 4);
-                } else { if (strict) { err = "missing sample encryption metadata"; return false; } tpos = traf.off + traf.size; continue; }
+                } else { if (declared_clear) { tpos = traf.off + traf.size; continue; }
+                    if (strict) { err = "missing sample encryption metadata (traf=" + fragment_boxes(seg, traf) + ", samples=" + std::to_string(cnt) + ", file_offset=" + std::to_string(file_offset + moof_off) + ")"; return false; } tpos = traf.off + traf.size; continue; }
 
                 if (base_off < -(int64_t)data_off || base_off > (int64_t)seg.size() - (int64_t)data_off) { err = "invalid sample offset"; return false; }
                 size_t sp = (size_t)(base_off + data_off);
@@ -378,13 +443,13 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
                         gi++;
                     }
                     SampleEnc& e = encs[i];
-                    Bytes iv16 = e.iv.empty() ? t.const_iv : e.iv; iv16.resize(16, 0);
-                    if (!e.iv.empty() || !t.const_iv.empty()) {
+                    Bytes iv16 = e.iv.empty() ? crypto.const_iv : e.iv; iv16.resize(16, 0);
+                    if (!e.iv.empty() || !crypto.const_iv.empty()) {
                         cdm::InputBuffer_2 in; memset(&in, 0, sizeof in);
-                        in.data = &seg[sp]; in.data_size = ssz; in.encryption_scheme = (t.scheme == 0x63626373) ? cdm::EncryptionScheme::kCbcs : cdm::EncryptionScheme::kCenc;
-                        in.key_id = t.kid; in.key_id_size = 16; in.iv = iv16.data(); in.iv_size = 16;
+                        in.data = &seg[sp]; in.data_size = ssz; in.encryption_scheme = (crypto.scheme == 0x63626373) ? cdm::EncryptionScheme::kCbcs : cdm::EncryptionScheme::kCenc;
+                        in.key_id = crypto.kid; in.key_id_size = 16; in.iv = iv16.data(); in.iv_size = 16;
                         in.subsamples = e.subs.empty() ? nullptr : e.subs.data(); in.num_subsamples = (uint32_t)e.subs.size();
-                        in.pattern.crypt_byte_block = t.crypt; in.pattern.skip_byte_block = t.skip;
+                        in.pattern.crypt_byte_block = crypto.crypt; in.pattern.skip_byte_block = crypto.skip;
                         if (frames) {
 
                             { size_t q = sp, qe = sp + ssz; while (q + 4 <= qe) { uint32_t nl = rd32(&seg[q]); seg[q] = 0; seg[q + 1] = 0; seg[q + 2] = 0; seg[q + 3] = 1; q += 4 + (size_t)nl; } }
@@ -402,7 +467,7 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
                         }
                         HDecrypted blk; cdm::Status st;
                         { std::lock_guard<std::mutex> l(g_cdm_mx); st = g_cdm->Decrypt(in, &blk); }
-                        if (st != cdm::kSuccess) { char ih[40]; for (int q = 0; q < 16; q++) snprintf(ih + q * 2, 3, "%02x", iv16[q]); std::string ss; for (size_t q = 0; q < e.subs.size() && q < 4; q++) ss += std::to_string(e.subs[q].clear_bytes) + "/" + std::to_string(e.subs[q].cipher_bytes) + " "; LOG("decrypt amostra %u/%u status=%d size=%u iv=%s ivsz=%u subs=%u[%s] scheme=%d pat=%u:%u", i, cnt, (int)st, ssz, ih, (unsigned)t.iv_size, (unsigned)e.subs.size(), ss.c_str(), (int)in.encryption_scheme, (unsigned)t.crypt, (unsigned)t.skip); err = "Decrypt status " + std::to_string((int)st); return false; }
+                        if (st != cdm::kSuccess) { char ih[40]; for (int q = 0; q < 16; q++) snprintf(ih + q * 2, 3, "%02x", iv16[q]); std::string ss; for (size_t q = 0; q < e.subs.size() && q < 4; q++) ss += std::to_string(e.subs[q].clear_bytes) + "/" + std::to_string(e.subs[q].cipher_bytes) + " "; LOG("decrypt amostra %u/%u status=%d size=%u iv=%s ivsz=%u subs=%u[%s] scheme=%d pat=%u:%u", i, cnt, (int)st, ssz, ih, (unsigned)crypto.iv_size, (unsigned)e.subs.size(), ss.c_str(), (int)in.encryption_scheme, (unsigned)crypto.crypt, (unsigned)crypto.skip); err = "Decrypt status " + std::to_string((int)st); return false; }
                         cdm::Buffer* ob = blk.DecryptedBuffer(); if (!ob || ob->Size() != ssz) { err = "tamanho decriptado inesperado"; return false; }
                         memcpy(&seg[sp], ob->Data(), ssz); done++;
                     }
