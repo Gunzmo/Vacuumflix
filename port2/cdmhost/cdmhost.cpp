@@ -327,7 +327,7 @@ static bool vdec_init(const Track& t, std::string& err) {
 }
 struct SampleEnc { Bytes iv; std::vector<cdm::SubsampleEntry> subs; };
 struct VRange { size_t from = 0, maxn = (size_t)-1, next = 0; bool partial = false; };
-static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes* frames = nullptr, VRange* vr = nullptr) {
+static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes* frames = nullptr, VRange* vr = nullptr, uint64_t file_offset = 0, bool strict = false) {
     size_t gi = 0;
     size_t pos = 0; Box mf; int done = 0;
     while (next_box(seg, pos, seg.size(), mf)) {
@@ -338,8 +338,8 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
                 Box tfhd, trun, senc, saiz, saio;
                 if (!find_child(seg, traf, "tfhd", tfhd) || !find_child(seg, traf, "trun", trun)) { tpos = traf.off + traf.size; continue; }
 
-                const uint8_t* th = &seg[tfhd.off + tfhd.hdr]; uint32_t tf = rd32(th) & 0xffffff; size_t o = 8; uint64_t base_off = moof_off; uint32_t def_size = 0;
-                if (tf & 1) { base_off = rd64(th + o); o += 8; } if (tf & 2) o += 4; if (tf & 8) o += 4; if (tf & 0x10) { def_size = rd32(th + o); o += 4; } if (tf & 0x20) o += 4;
+                const uint8_t* th = &seg[tfhd.off + tfhd.hdr]; uint32_t tf = rd32(th) & 0xffffff; size_t o = 8; int64_t base_off = (int64_t)moof_off; uint32_t def_size = 0;
+                if (tf & 1) { uint64_t absolute = rd64(th + o); if (absolute > INT64_MAX || file_offset > INT64_MAX) { err = "invalid fragment base offset"; return false; } base_off = (int64_t)absolute - (int64_t)file_offset; o += 8; } if (tf & 2) o += 4; if (tf & 8) o += 4; if (tf & 0x10) { def_size = rd32(th + o); o += 4; } if (tf & 0x20) o += 4;
 
                 const uint8_t* tr = &seg[trun.off + trun.hdr]; uint32_t rf = rd32(tr) & 0xffffff; uint32_t cnt = rd32(tr + 4); size_t ro = 8; int32_t data_off = 0;
                 if (rf & 1) { data_off = (int32_t)rd32(tr + ro); ro += 4; } if (rf & 4) ro += 4;
@@ -366,9 +366,10 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
                         so = start + isz;
                     }
                     memcpy(&seg[saiz.off + 4], "free", 4); memcpy(&seg[saio.off + 4], "free", 4);
-                } else { tpos = traf.off + traf.size; continue; }
+                } else { if (strict) { err = "missing sample encryption metadata"; return false; } tpos = traf.off + traf.size; continue; }
 
-                size_t sp = base_off + data_off;
+                if (base_off < -(int64_t)data_off || base_off > (int64_t)seg.size() - (int64_t)data_off) { err = "invalid sample offset"; return false; }
+                size_t sp = (size_t)(base_off + data_off);
                 for (uint32_t i = 0; i < cnt; i++) {
                     uint32_t ssz = sizes[i]; if (sp + ssz > seg.size()) { err = "amostra fora do segmento"; return false; }
                     if (frames && vr) {
@@ -416,7 +417,7 @@ static bool decrypt_segment(const Track& t, Bytes& seg, std::string& err, Bytes*
     (void)done; return true;
 }
 
-enum { OP_PING = 1, OP_CREATE_SESSION = 2, OP_UPDATE_SESSION = 3, OP_CLOSE_SESSION = 4, OP_SET_INIT = 5, OP_DECRYPT_SEG = 6, OP_SET_CERT = 7, OP_VDEC_SEG = 8 };
+enum { OP_PING = 1, OP_CREATE_SESSION = 2, OP_UPDATE_SESSION = 3, OP_CLOSE_SESSION = 4, OP_SET_INIT = 5, OP_DECRYPT_SEG = 6, OP_SET_CERT = 7, OP_VDEC_SEG = 8, OP_DROP_TRACK = 9 };
 static bool read_full(int fd, void* b, size_t n) { uint8_t* p = (uint8_t*)b; while (n) { ssize_t k = read(fd, p, n); if (k <= 0) return false; p += k; n -= k; } return true; }
 static bool write_full(int fd, const void* b, size_t n) { const uint8_t* p = (const uint8_t*)b; while (n) { ssize_t k = write(fd, p, n); if (k <= 0) return false; p += k; n -= k; } return true; }
 static std::string S(const Bytes& b) { return std::string(b.begin(), b.end()); }
@@ -424,6 +425,8 @@ static std::string S(const Bytes& b) { return std::string(b.begin(), b.end()); }
 static int handle(uint32_t op, const std::vector<Bytes>& a, std::vector<Bytes>& out) {
     std::string err;
     switch (op) {
+    case OP_DROP_TRACK: {
+        if (a.empty()) return 1; std::lock_guard<std::mutex> l(g_trk_mx); g_tracks.erase(S(a[0])); return 0; }
     case OP_PING: out.push_back(Bytes{ 'p', 'o', 'n', 'g' }); return 0;
     case OP_CREATE_SESSION: {
         if (a.size() < 2) return 1; uint32_t t = a[0].empty() ? 0 : a[0][0]; std::string sid; Msg m;
@@ -444,9 +447,11 @@ static int handle(uint32_t op, const std::vector<Bytes>& a, std::vector<Bytes>& 
         if (a.size() < 2) return 1; Bytes init = a[1]; Track t; if (!process_init(init, t)) { out.push_back(Bytes{ 'b', 'a', 'd' }); return 1; }
         { std::lock_guard<std::mutex> l(g_trk_mx); g_tracks[S(a[0])] = t; }
         { char kh[40]; for (int q = 0; q < 16; q++) snprintf(kh + q * 2, 3, "%02x", t.kid[q]); LOG("init track=%s scheme=%08x protegido=%d iv=%u kid=%s", S(a[0]).c_str(), t.scheme, t.protected_, t.iv_size, kh); }
-        std::string verr; bool vd = t.protected_ && t.video && !getenv("CDM_NOVDEC") && vdec_init(t, verr); if (t.protected_ && t.video && !vd) LOG("vdec init falhou: %s", verr.c_str());
+        bool decrypt_only = a.size() > 2 && S(a[2]) == "decrypt-only";
+        std::string verr; bool vd = !decrypt_only && t.protected_ && t.video && !getenv("CDM_NOVDEC") && vdec_init(t, verr); if (!decrypt_only && t.protected_ && t.video && !vd) LOG("vdec init falhou: %s", verr.c_str());
         out.push_back(init); out.push_back(Bytes(t.kid, t.kid + 16));
-        { std::string dim = vd ? std::to_string(t.w) + "x" + std::to_string(t.h) : std::string(); out.push_back(Bytes(dim.begin(), dim.end())); } return 0; }
+        { std::string dim = vd ? std::to_string(t.w) + "x" + std::to_string(t.h) : std::string(); out.push_back(Bytes(dim.begin(), dim.end())); }
+        if (decrypt_only) out.push_back(Bytes{'d','e','c','r','y','p','t','-','o','n','l','y'}); return 0; }
     case OP_VDEC_SEG: {
 
         if (a.size() < 4) return 1; Track t; { std::lock_guard<std::mutex> l(g_trk_mx); auto it = g_tracks.find(S(a[0])); if (it == g_tracks.end()) { out.push_back(Bytes{ 'n', 'o', 'i', 'n', 'i', 't' }); return 1; } t = it->second; }
@@ -461,7 +466,7 @@ static int handle(uint32_t op, const std::vector<Bytes>& a, std::vector<Bytes>& 
         out.push_back(frames); out.push_back(Bytes(nt.begin(), nt.end())); return 0; }
     case OP_DECRYPT_SEG: {
         if (a.size() < 2) return 1; Track t; { std::lock_guard<std::mutex> l(g_trk_mx); auto it = g_tracks.find(S(a[0])); if (it == g_tracks.end()) { out.push_back(Bytes{ 'n', 'o', 'i', 'n', 'i', 't' }); return 1; } t = it->second; }
-        Bytes seg = a[1]; if (t.protected_ && !decrypt_segment(t, seg, err)) { LOG("decrypt falhou: %s", err.c_str()); out.push_back(Bytes(err.begin(), err.end())); return 1; }
+        Bytes seg = a[1]; if (t.protected_ && !decrypt_segment(t, seg, err, nullptr, nullptr, a.size() > 2 ? strtoull(S(a[2]).c_str(), nullptr, 10) : 0, a.size() > 2)) { LOG("decrypt falhou: %s", err.c_str()); out.push_back(Bytes(err.begin(), err.end())); return 1; }
         out.push_back(seg); return 0; }
     default: return 1;
     }

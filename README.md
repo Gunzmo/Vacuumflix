@@ -1,3 +1,7 @@
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:0fd9f8760939fdda5702921eceabc4a17969305349445e5823c02af9f883248d -->
+
 # Vacuumflix
 - Netflix with its original TV/console interface, made for **SteamOS** and **Bazzite**
 - Runs on any Linux desktop and works with a game controller
@@ -79,7 +83,63 @@ flatpak run --env=VACUUMFLIX_MAX_RESOLUTION=720 io.vacuumflix.Vacuumflix
 This limits the downloaded video rendition; it does not resize the UI. The limit
 is applied to the bundled Netflix player and depends on its manifest format.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:a61f439646e2ccce7c5b8e446f42039c282166c2b5fcf6b4617f823908c70a2e -->
+
+## Decrypted MP4 disk buffer
+
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e0ff39a48cfb9a5f4e9114ad3c0776e9a7b4918028da757e09e8d4066a7704e3 -->
+
+Rebuild the app and restart it so the updated CDM host is used.
+
+Set `VACUUMFLIX_DISK_CACHE=1` to download and decrypt each selected fragmented
+
+<!-- /coderabbit-ai-generated:v1 -->
+MP4 rendition completely before its media ranges reach playback. A small initial
+header request is allowed through first so the player can obtain its license.
+Video and audio stay compressed in separate MP4 files; there is no raw-frame
+cache or re-encoding. Widevine performs decryption during preparation, and
+FFmpeg decodes the cached video using the configured VA-API/software mode.
+
+`VACUUMFLIX_DISK_CACHE=1` deliberately changes the normal protected playback
+path: it writes **clear MP4 data** to a private, session-only cache. Files are
+removed on normal app exit and abandoned files are removed at the next launch.
+The app still needs an authenticated Netflix session and a usable Widevine
+license to prepare protected content. If the CDM refuses decrypt-only access,
+preparation reports an error; it does not silently use Widevine frame decoding.
+Actual Netflix/CDM compatibility and CPU savings on a Celeron N3050 have not
+been verified.
+
+The combined cache limit is **10 GB (10,000,000,000 bytes)**, including audio,
+video and incomplete downloads. Unused files are evicted first. If the active
+renditions cannot fit, preparation fails; choose a smaller rendition such as
+720p. Downloads require a server that supplies complete MP4 files with HTTP 200.
+A rendition switch may require another complete download. Preparation logs appear
+with `[cache]`; startup can take as long as downloading and decrypting the title.
+
+`VACUUMFLIX_CACHE_DIR` selects the cache directory. The default is
+`$XDG_CACHE_HOME/vacuumflix/decrypted-mp4`, or
+`~/.cache/vacuumflix/decrypted-mp4`. Only one app instance can own a cache
+directory at a time. Use a disk directory writable by the application; Flatpak
+uses its own cache location by default. Leave `VACUUMFLIX_DISK_CACHE` unset for
+normal playback.
+
+```sh
+VACUUMFLIX_DISK_CACHE=1 VACUUMFLIX_MAX_RESOLUTION=720 LIBVA_DRIVER_NAME=i965 ./netflix
+# Flatpak:
+flatpak run --env=VACUUMFLIX_DISK_CACHE=1 --env=VACUUMFLIX_MAX_RESOLUTION=720 --env=LIBVA_DRIVER_NAME=i965 io.vacuumflix.Vacuumflix
+```
+
+Development checks: `node --test port2/tests/mp4-cache.test.js port2/tests/decrypt-mp4.test.js port2/tests/media.test.js`.
+Native bridge check: compile `port2/tests/cdm_cache.cpp` with
+`g++ -std=c++17 -O2 -Wno-attributes -ldl -lpthread` and run the resulting binary.
+
 ## GPU acceleration
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 
 <!-- /coderabbit-ai-generated:v1 -->
@@ -92,8 +152,9 @@ VA-API decoding is enabled automatically for video decoded by FFmpeg. The app
 tries available `/dev/dri/renderD*` devices, uses libva's selected driver, and
 tries `i965` if automatic driver initialization fails. An unsupported codec or
 decoder error retries the stream in software without replaying displayed frames.
-Protected Netflix video currently uses Widevine's software decoder; it benefits
-from GPU presentation but cannot use VA-API decoding through that CDM interface.
+Default protected Netflix playback uses Widevine's software decoder and GPU
+presentation. The optional decrypted MP4 disk buffer above instead prepares
+compressed clear media for FFmpeg, where VA-API decoding can be used.
 Widevine L3 and the existing playback quality limits are unchanged.
 
 ### Legacy Intel (i965/libva)
@@ -169,6 +230,9 @@ these tests can run with Mesa software rendering.
 Vacuumflix is an unofficial client. It is not affiliated with, endorsed or supported by Netflix, Inc. "Netflix" is a trademark of Netflix, Inc.
 
 - A valid Netflix subscription is required. Vacuumflix does not provide, unlock or bypass access to any content.
-- Playback uses Widevine L3 (software DRM), so the maximum quality is 1080p. Vacuumflix does not remove, break or work around DRM.
+- Playback uses Widevine L3 (software DRM), so the maximum quality is 1080p. Normal playback keeps DRM handling in Widevine. The optional disk buffer stores session-only clear MP4 data after licensed CDM decryption, as described above.
 - The Netflix TV interface scripts and the boot animation belong to Netflix, Inc.; the Widevine CDM belongs to Google. They are included only so the app works as tested, and their owners keep all rights.
 - Netflix can change its servers or interface at any time, which may break parts of the app until it is updated.
+
+
+<!-- /coderabbit-ai-generated:v1 -->

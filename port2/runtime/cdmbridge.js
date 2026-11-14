@@ -1,6 +1,6 @@
 const net = require('net');
 const SOCK = process.env.CDM_SOCK || '/tmp/gibbon-cdm.sock';
-const OP = { PING: 1, CREATE: 2, UPDATE: 3, CLOSE: 4, SET_INIT: 5, DECRYPT: 6, SET_CERT: 7, VDEC_SEG: 8 };
+const OP = { PING: 1, CREATE: 2, UPDATE: 3, CLOSE: 4, SET_INIT: 5, DECRYPT: 6, SET_CERT: 7, VDEC_SEG: 8, DROP_TRACK: 9 };
 function call(op, args) {
   return new Promise((res, rej) => {
     const c = net.connect(SOCK); const parts = [Buffer.alloc(8)];

@@ -38,9 +38,50 @@ module.exports = function make(ctx) {
   const { mlog, mono, logProxy } = ctx;
   let tid = 0, srcId = 0, bufId = 0;
   const tracks = new Map(), requests = new Map(), sources = new Map(), buffers = new Map(), players = new Map();
-  let mr;
+  let mr, diskCache, cacheClosing = Promise.resolve();
+  const cacheEnabled = process.env.VACUUMFLIX_DISK_CACHE === '1';
+  const requestBody = r => r.cached ? r.cached.read(r.start, r.end) : r.body;
+  const releaseRequest = r => { r.aborted = true; r.controller?.abort(); r.cached?.release(); r.cached = null; };
+  function releaseSourceRequests(source) {
+    if (!cacheEnabled || !source) return;
+    for (const bid of source.buffers) {
+      const b = buffers.get(bid);
+      for (const part of b?.parts || []) if (part.req) { releaseRequest(part.req); requests.delete(part.req.id); }
+      if (b) { b.parts.length = 0; b.eos = false; }
+    }
+  }
+  async function startCachedRequest(r) {
+    if (r.aborted) return;
+    const t0 = mono();
+    r.controller = new AbortController();
+    mr.emit('onloadstart', { requestId: r.id, timestamp: t0 });
+    try {
+      await cacheClosing;
+      if (r.aborted) return;
+      diskCache ||= new (require('./mp4-cache').Mp4Cache)({ log: msg => console.log('[cache]', msg) });
+      r.cached = await diskCache.acquire(r.url, { signal: r.controller.signal });
+      if (r.aborted) { r.cached.release(); r.cached = null; return; }
+      const size = r.cached.size, end = r.end < 0 ? size - 1 : Math.min(r.end, size - 1);
+      const body = requestBody(r), ts = mono();
+      const headers = ['content-type: video/mp4', 'content-length: ' + body.length, 'accept-ranges: bytes'];
+      if (r.start || r.end >= 0) headers.push(`content-range: bytes ${r.start}-${end}/${size}`);
+      mr.emit('onfirstbyte', { requestId: r.id, timestamp: ts, start: t0, headers, connect: 0 });
+      mr.emit('onprogress', { progress: [{ requestId: r.id, timestamp: ts, bytes: body.length, rt: [] }] });
+      mr.emit('onchunkfirstbyte', { requestId: r.id, timestamp: ts, chunkId: 0 });
+      const ab = r.responseType === 0 ? require('./webcrypto').u8(body).buffer : undefined;
+      mr.emit('onchunkcomplete', { requestId: r.id, timestamp: ts, chunkId: 0, chunkSize: body.length, data: ab });
+      mr.emit('oncomplete', { requestId: r.id, timestamp: ts, data: ab });
+      mlog('cache.done', r.id, 'bytes', body.length);
+    } catch (e) {
+      r.cached?.release(); r.cached = null;
+      if (!r.aborted) { r.failed = true; console.error('[cache]', e.message); mr.emit('onerror', { requestId: r.id, timestamp: mono(), errorcode: 'HTTP', httpcode: 0 }); }
+    }
+  }
 
   function startRequest(r) {
+    if (r.aborted) return;
+    // Initialization byte ranges must reach NRDJS first so it can acquire a license.
+    if (cacheEnabled && !(r.start === 0 && r.end >= 0)) { startCachedRequest(r); return; }
     const u = new URL(r.url); const lib = u.protocol === 'https:' ? https : http;
     const headers = {}; if (r.end >= 0) headers.Range = `bytes=${r.start}-${r.end}`; else if (r.start > 0) headers.Range = `bytes=${r.start}-`;
     const t0 = mono();
@@ -78,16 +119,26 @@ module.exports = function make(ctx) {
   const base = {
     synchronousTrackCreate: true,
     addDownloadTracks(c) { return { success: true, trackids: (c || []).map(cfg => { const id = ++tid; tracks.set(id, cfg); return id; }) }; },
-    removeDownloadTracks(ids) { (ids || []).forEach(i => tracks.delete(i)); return { success: true }; },
+    removeDownloadTracks(ids) { (ids || []).forEach(i => { tracks.delete(i); if (cacheEnabled) for (const r of requests.values()) if (r.track === i && !r.appended) { releaseRequest(r); requests.delete(r.id); } }); return { success: true }; },
     reconfigureDownloadTrack(id, cfg, cb) { cb && setImmediate(() => cb({ success: true })); },
     createRequest(id, track, url, start, end, responseType) {
       const r = { id, track, url, start: start || 0, end: end === undefined ? -1 : end, responseType, appended: false }; requests.set(id, r);
       setImmediate(() => startRequest(r)); return { success: true };
     },
     swapRequestURL(id, url) { const r = requests.get(id); if (r) r.url = url; return { success: true }; },
-    abortRequest(id) { const r = requests.get(id); if (r) { r.aborted = true; try { r.http && r.http.destroy(); } catch {} } return { success: true }; },
+    abortRequest(id) { const r = requests.get(id); if (r) { releaseRequest(r); try { r.http && r.http.destroy(); } catch {} } return { success: true }; },
     createMediaSource(_, x) { const id = ++srcId; sources.set(id, { id, buffers: [], player: x }); mlog('createMediaSource', id, x); return { success: true, sourceid: id }; },
-    destroyMediaSource(id) { sources.delete(id); return { success: true }; },
+    destroyMediaSource(id) {
+      const source = sources.get(id);
+      if (source && cacheEnabled) {
+        releaseSourceRequests(source);
+        for (const bid of source.buffers) {
+          buffers.delete(bid);
+        }
+        for (const player of players.values()) if (player.path === source.player) player.__detachSource?.(id);
+      }
+      sources.delete(id); return { success: true };
+    },
     createSourceBuffers(sid, types) {
       const ids = (types || []).map(t => { const id = ++bufId; buffers.set(id, { id, source: sid, type: t === 0 ? 'audio' : 'video', parts: [], eos: false }); const s = sources.get(sid); s && s.buffers.push(id); return id; });
       mlog('createSourceBuffers', sid, types, ids); return { success: true, bufferids: ids };
@@ -96,7 +147,7 @@ module.exports = function make(ctx) {
       mlog('attachData', bid, data && data.byteLength, 'flag', flag); ctx.onAppend && ctx.onAppend(bid); return { success: true }; },
     attachRequestToSourceBuffer(rid, bid, flag, sid) { const r = requests.get(rid), b = buffers.get(bid);
       mlog('attachRequest', rid, '->buf', bid, 'flag', flag, 'have', r && r.body && r.body.length);
-      if (r && b) { r.appended = true; b.parts.push({ kind: 'req', req: r, off: b.tsOffset }); const go = () => { if (r.body) { dump(bid, 'req' + rid, r.body); ctx.onAppend && ctx.onAppend(bid); } else setTimeout(go, 20); }; go(); }
+      if (r && b) { r.appended = true; b.parts.push({ kind: 'req', req: r, off: b.tsOffset }); const go = () => { if (r.aborted || r.failed || !buffers.has(bid)) return; if (r.body || r.cached) { if (DUMP) dump(bid, 'req' + rid, requestBody(r)); ctx.onAppend && ctx.onAppend(bid); } else setTimeout(go, 20); }; go(); }
       return { success: true }; },
     endOfStream(bid) { const b = buffers.get(bid); if (b) b.eos = true; mlog('endOfStream', bid); return { success: true }; },
     sourceBufferSetTimestampOffset(sid, bid, off, ts) { const b = buffers.get(bid); if (b) b.tsOffset = [off, ts]; mlog('tsOffset', bid, off, ts); return { success: true }; },
@@ -123,12 +174,12 @@ module.exports = function make(ctx) {
   function makePlayer(index) {
     const base = Object.assign({ index, path: '/mediasourceplayer/' + index, state: ST.CLOSED }, ST);
     const p = logProxy('player' + index, base);
-    let pauseKeep = null; let rebase = false; let startPts = 0, openArgs = null, pipe = null, paused = false, ticker = null, openTimer = null;
+    let pauseKeep = null; let rebase = false; let startPts = 0, openArgs = null, pipe = null, paused = false, ticker = null, openTimer = null, playTimer = null;
     const setState = (s) => { base.state = s; base.emit('statechanged', { type: 'statechanged', state: s, time: mono() }); };
     const mySource = () => { let best = null; for (const sc of sources.values()) if (sc.player === base.path && (!best || sc.id > best.id)) best = sc; return best; };
     const frameFile = FRAME_DIR + '/gibbon_video_' + index + '.rgba';
     const clearFrame = () => { try { fs.renameSync(frameFile, frameFile + '.last'); } catch {} };
-    const killPipe = () => { clearInterval(pauseKeep); try { prReset(); } catch {} clearFrame(); if (pipe) { pipe.dead = true; for (const c of pipe.chains) c.kill(); pipe = null; } };
+    const killPipe = () => { clearTimeout(playTimer); clearInterval(pauseKeep); try { prReset(); } catch {} clearFrame(); if (pipe) { pipe.dead = true; for (const c of pipe.chains) c.kill(); pipe = null; } };
     const isInit = (d) => d.length > 8 && d.toString('latin1', 4, 8) === 'ftyp' && d.indexOf('moov') > 0;
     const fps = () => (openArgs && openArgs.videoAttributes && openArgs.videoAttributes.frameRateValue) ? openArgs.videoAttributes.frameRateValue / (openArgs.videoAttributes.frameRateScale || 1) : 24;
 
@@ -234,7 +285,7 @@ module.exports = function make(ctx) {
         if (proc) { const sg = segs[si]; const cap = (kind === 'video' && sg.raw) ? 4 * Math.ceil(sg.raw.w * sg.raw.h * 3 / 2) : Infinity;
           while (fed < sg.chunks.length) {
             if (proc.stdin.writableLength >= cap) { if (!waitDrain) { waitDrain = true; const p = proc; p.stdin.once('drain', () => { waitDrain = false; if (proc === p) advance(); }); } break; }
-            try { proc.stdin.write(sg.chunks[fed]); } catch {} fed++;
+            try { const chunk = sg.chunks[fed]; proc.stdin.write(chunk?.read ? chunk.read() : chunk); } catch {} fed++;
           } if (sg.closed && fed >= sg.chunks.length) { try { proc.stdin.end(); } catch {} } }
         else if (si >= segs.length && segs.length && segs[segs.length - 1].closed) { if (!done) { done = true; st.onDone(kind); } }
       }
@@ -246,16 +297,16 @@ module.exports = function make(ctx) {
           do {
             again = false;
             while (cursor < b.parts.length && !dead) {
-              const part = b.parts[cursor]; const data = part.kind === 'data' ? part.data : part.req.body; if (!data) break; cursor++;
+              const part = b.parts[cursor]; const data = part.kind === 'data' ? part.data : requestBody(part.req); if (!data) break; cursor++;
               if (isInit(data)) {
                 if (cur && data.equals(cur)) continue; cur = data; if (segs.length) segs[segs.length - 1].closed = true;
                 const enc = data.indexOf('encv') > 0 || data.indexOf('enca') > 0; let d = data;
                 { const ti = data.indexOf('tenc'); if (ti > 0) mlog('track kid', b.id, data.slice(ti + 12, ti + 28).toString('hex')); }
                 mlog('init buf', b.id, b.type, 'bytes', data.length, 'enc', enc, ['encv','enca','avc1','avc3','hvc1','mp4a','ec-3','sinf','pssh','tenc','senc'].filter(x => data.indexOf(x) > 0).join(','));
                 let raw = null;
-                if (enc) { const r = await cdmb().call(cdmb().OP.SET_INIT, [trackKey, data]); if (r.status === 0) { d = r.rets[0]; const dim = r.rets[2] ? String(r.rets[2]) : ''; if (kind === 'video' && dim) { const m = dim.split('x'); raw = { w: +m[0], h: +m[1] }; } } else mlog('SET_INIT falhou', String(r.rets[0])); }
+                if (enc) { const r = await cdmb().call(cdmb().OP.SET_INIT, [trackKey, data, ...(cacheEnabled ? ['decrypt-only'] : [])]); if (cacheEnabled && (r.status !== 0 || String(r.rets[3]) !== 'decrypt-only')) throw new Error('Cache requires successful decrypt-only CDM initialization; rebuild and restart the app'); if (r.status === 0) { d = r.rets[0]; const dim = r.rets[2] ? String(r.rets[2]) : ''; if (!cacheEnabled && kind === 'video' && dim) { const m = dim.split('x'); raw = { w: +m[0], h: +m[1] }; } } else mlog('SET_INIT falhou', String(r.rets[0])); }
                 if (kind === 'video') { (globalThis.__vidProt = globalThis.__vidProt || {})[index] = !!raw; }
-                segs.push({ chunks: raw ? [] : [d], closed: false, enc, raw, ts: mdhdTimescale(data) });
+                segs.push({ chunks: raw ? [] : [d], closed: false, enc: enc && !cacheEnabled, raw, ts: mdhdTimescale(data) });
               } else if (segs.length) {
                 const sg = segs[segs.length - 1]; let d = data; if (kind === 'video' && sg.t0 === undefined) { const t = tfdtSec(data, sg.ts); if (t !== undefined) { sg.t0 = t; const ff = segFps(data, sg.ts); if (ff > 5 && ff < 125) sg.fps = ff; mlog('stream-fps', 'real=' + ff.toFixed(3), 'declarado=' + fps().toFixed(3), 'ts=' + sg.ts, 't0=' + sg.t0.toFixed(2)); } }
                 if (kind === 'audio' && sg.sessStart === undefined && sg.ts) {
@@ -286,7 +337,8 @@ module.exports = function make(ctx) {
                 } else {
                   if (sg.enc) { const r = await cdmb().call(cdmb().OP.DECRYPT, [trackKey, data]); if (r.status === 0) d = r.rets[0]; else mlog('DECRYPT falhou', String(r.rets[0])); }
                   if (fragInfo(d).samples > 0) sg.hasMedia = true;
-                  sg.chunks.push(fixSdi(d));
+                  const cachedRequest = part.kind === 'req' && part.req.cached ? part.req : null;
+                  sg.chunks.push(cachedRequest ? { read: () => fixSdi(requestBody(cachedRequest)) } : fixSdi(d));
                 }
               }
               advance();
@@ -298,11 +350,13 @@ module.exports = function make(ctx) {
       };
       return c;
     }
-    const feed = () => { if (pipe) for (const c of pipe.chains) c.pump().catch(e => mlog('pump erro', e && e.message)); };
+    const feed = () => { if (pipe) for (const c of pipe.chains) c.pump().catch(e => { mlog('pump erro', e && e.message); if (cacheEnabled) { console.error('[cache]', e.message); killPipe(); setState(ST.STOPPED); base.emit('error', { type: 'error', error: 'NFErr_DRMFailed', errormsg: e.message, time: mono() }); } }); };
     function startPipe() {
       const src = mySource(); if (!src) return false;
       const bs = src.buffers.map(i => buffers.get(i)); const vb = bs.find(b => b.type === 'video'), ab = bs.find(b => b.type === 'audio');
       if (!vb || !vb.parts.length) return false;
+      // Wait for selected audio as well, avoiding video starting during audio preparation.
+      if (cacheEnabled && bs.some(b => b && b.parts.some(p => p.kind === 'req' && !p.req.body && !p.req.cached))) return false;
       let seq = 0, lastEmit = 0, frames = 0; const fpsv = fps();
       const st = {
         onFrame(sz, frame, relMs, absPts, sessPts) {
@@ -317,21 +371,22 @@ module.exports = function make(ctx) {
         },
         onDone() { if (pipe && pipe.chains.every(c => c.done) && base.state === ST.PLAYING) { base.emit('endofstream', { type: 'endofstream', media: 0, time: mono() }); base.emit('endofstream', { type: 'endofstream', media: 1, time: mono() }); } },
       };
-      pipe = { st, chains: [makeChain(vb, 'video', st)].concat(ab ? [makeChain(ab, 'audio', st)] : []) };
+      pipe = { source: src.id, st, chains: [makeChain(vb, 'video', st)].concat(ab ? [makeChain(ab, 'audio', st)] : []) };
       feed(); return true;
     }
     ctx.onAppend = ((prev) => (bid) => { prev && prev(bid); players.forEach(pl => pl.__feed && pl.__feed()); })(ctx.onAppend);
     base.__feed = feed;
+    base.__detachSource = id => { if (pipe?.source === id) base.stop(); };
 
     base.open = (args) => { if (process.env.OPENSTACK) console.log('[open-stack]', JSON.stringify(args).slice(0,200), '\n'+String(new Error().stack).split('\n').slice(1,60).join('\n')); openArgs = args; startPts = (args && args.pts) || 0; killPipe(); mlog('player.open', args); setState(ST.OPENING);
       clearTimeout(openTimer); openTimer = setTimeout(() => { if (base.state === ST.OPENING) { setState(ST.STOPPED); base.emit('opencomplete', { type: 'opencomplete', time: mono() }); } }, 300); };
-    base.close = () => { mlog('player.close', 'estado=' + base.state); clearTimeout(openTimer); if (globalThis.__vidProt) globalThis.__vidProt[index] = false; killPipe(); if (base.state !== ST.CLOSED) setState(ST.CLOSED); };
-    const swimTo = (arg) => { const o = (arg && typeof arg === 'object') ? arg : { pts: arg }; const cur = base.__curPts !== undefined ? base.__curPts : startPts; const tgt = typeof o.pts !== 'number' ? undefined : (o.absolute ? o.pts : cur + o.pts); mlog('player.swim ->', JSON.stringify(o), 'atual=' + cur, 'alvo=' + tgt); clearTimeout(openTimer); if (typeof tgt === 'number' && isFinite(tgt)) { startPts = Math.max(0, tgt); base.__curPts = startPts; } killPipe(); { const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b) { b.parts.length = 0; b.eos = false; } } }    
+    base.close = () => { mlog('player.close', 'estado=' + base.state); clearTimeout(openTimer); releaseSourceRequests(mySource()); if (globalThis.__vidProt) globalThis.__vidProt[index] = false; killPipe(); if (base.state !== ST.CLOSED) setState(ST.CLOSED); };
+    const swimTo = (arg) => { const o = (arg && typeof arg === 'object') ? arg : { pts: arg }; const cur = base.__curPts !== undefined ? base.__curPts : startPts; const tgt = typeof o.pts !== 'number' ? undefined : (o.absolute ? o.pts : cur + o.pts); mlog('player.swim ->', JSON.stringify(o), 'atual=' + cur, 'alvo=' + tgt); clearTimeout(openTimer); if (typeof tgt === 'number' && isFinite(tgt)) { startPts = Math.max(0, tgt); base.__curPts = startPts; } killPipe(); releaseSourceRequests(mySource()); { const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b) { b.parts.length = 0; b.eos = false; } } }
       if (base.state !== ST.CLOSED) { base.state = ST.PLAYING; setState(ST.STOPPED); } };
     base.disableAudio = () => {
       mlog('player.disableAudio');
       if (pipe) { for (const c of pipe.chains) if (c.kind === 'audio') c.kill(); pipe.chains = pipe.chains.filter(c => c.kind !== 'audio'); }
-      const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b && b.type === 'audio') { b.parts.length = 0; b.eos = false; } }
+      const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b && b.type === 'audio') { if (cacheEnabled) for (const part of b.parts) if (part.req) { releaseRequest(part.req); requests.delete(part.req.id); } b.parts.length = 0; b.eos = false; } }
       setImmediate(() => base.emit('audiotrackchangestarted', { type: 'audiotrackchangestarted', time: mono() }));
       return { success: true };
     };
@@ -340,7 +395,7 @@ module.exports = function make(ctx) {
       const go = (n) => {
         if (!pipe) return;
         const sc = mySource(); const ab = sc && sc.buffers.map(i => buffers.get(i)).filter(b => b && b.type === 'audio' && b.parts.length).pop();
-        if (!ab) { if (n < 100) setTimeout(() => go(n + 1), 100); return; }
+        if (!ab) { if (cacheEnabled || n < 100) playTimer = setTimeout(() => go(n + 1), 100); return; }
         if (pipe.chains.some(c => c.kind === 'audio')) return;
         pipe.chains.push(makeChain(ab, 'audio', pipe.st)); feed();
       };
@@ -348,12 +403,12 @@ module.exports = function make(ctx) {
     };
     base.swim2 = (a) => { swimTo(a); };
     base.swim = (pts) => { swimTo(pts); };
-    base.stop = () => { mlog('player.stop', 'estado=' + base.state); killPipe(); rebase = true; { const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b) { b.parts.length = 0; b.eos = false; } } } if (base.state !== ST.CLOSED && base.state !== ST.STOPPED) setState(ST.STOPPED); };
+    base.stop = () => { mlog('player.stop', 'estado=' + base.state); killPipe(); releaseSourceRequests(mySource()); rebase = true; { const sc = mySource(); if (sc) for (const bid of sc.buffers) { const b = buffers.get(bid); if (b) { b.parts.length = 0; b.eos = false; } } } if (base.state !== ST.CLOSED && base.state !== ST.STOPPED) setState(ST.STOPPED); };
     base.play = (ptsArg) => {
       mlog('player.play', JSON.stringify(ptsArg), 'startPts=' + startPts, 'estado=' + base.state);
       if (process.env.OPENSTACK) console.log('[play-stack]', ptsArg, '\n'+String(new Error().stack).split('\n').slice(1,60).filter(l=>!/nrdjs.min/.test(l)).join('\n'));
       if (typeof ptsArg === 'number') startPts = ptsArg; paused = false;
-      const go = (n) => { if (base.state === ST.CLOSED) return; if (Date.now() - (globalThis.__gateTick || 0) < 1200) { setTimeout(() => go(n), 250); return; }     if (!pipe && !startPipe()) { if (n < 100) setTimeout(() => go(n + 1), 100); return; } };
+      const go = (n) => { if (base.state === ST.CLOSED || base.state === ST.STOPPED) return; if (cacheEnabled && paused) { playTimer = setTimeout(() => go(n), 100); return; } if (Date.now() - (globalThis.__gateTick || 0) < 1200) { playTimer = setTimeout(() => go(n), 250); return; }     if (!pipe && !startPipe()) { if (cacheEnabled || n < 100) playTimer = setTimeout(() => go(n + 1), 100); return; } };
       setState(ST.PLAYING); go(0);
     };
     base.play2 = () => base.play();
@@ -366,7 +421,7 @@ module.exports = function make(ctx) {
   }
   const factory = {
     createPlayer(index, cb) { const player = makePlayer(index); setImmediate(() => cb && cb({ success: true, path: player.path, player })); },
-    destroyPlayer(i, cb) { players.delete(i); cb && setImmediate(cb); },
+    destroyPlayer(i, cb) { if (cacheEnabled) players.get(i)?.close(); players.delete(i); cb && setImmediate(cb); },
   };
-  return { mediarequest: mr, base, factory, closeAll() { players.forEach(p => { try { p.close(); } catch {} }); } };
+  return { mediarequest: mr, base, factory, closeAll() { players.forEach(p => { try { p.close(); } catch {} }); for (const r of requests.values()) releaseRequest(r); cacheClosing = diskCache?.close() || Promise.resolve(); diskCache = null; } };
 };
