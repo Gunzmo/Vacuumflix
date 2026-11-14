@@ -4,6 +4,10 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const cp = require('child_process');
+const resolution = require('./resolution');
+const limit720 = process.env.VACUUMFLIX_MAX_RESOLUTION === '720';
+if (limit720) console.log('[video] Playback limited to 1280x720');
+else if (process.env.VACUUMFLIX_MAX_RESOLUTION) console.warn('[video] VACUUMFLIX_MAX_RESOLUTION supports only 720; using the default limit');
 
 process.on('unhandledRejection', e=>{ console.log('\n[UNHANDLED REJECTION]\n'+((e&&e.stack)||e)); });
 process.on('uncaughtException', e=>{ console.log('\n[UNCAUGHT]\n'+((e&&e.stack)||e)); });
@@ -69,6 +73,10 @@ function loadChunk(fname, url) {
   if (process.env.BACKLOCAL !== '0') code = code.split('An=(0,(_||(_=t(18123))).useGetSubmitActionCallback)(ze,{loggingCommand:null,loggingViewName:Me,parentLoggingViewName:Be.loggingViewName,route:mn,serverState:bn,setState:Sn,trackingInfo:Ne,transitionState:wn}),').join('An=function(__o){return function(a1,a2){var __done=!1,__go=function(){if(__done)return;__done=!0;try{var __h=t(98221);xn(__h.historyInsert({clViewName:null,pathname:"/welcomeContentLanding"},0));setTimeout(function(){try{xn(__h.historyPop())}catch(e){}},40)}catch(e){globalThis.__mark("[backlocal-err]",String(e))}},__r;try{__r=__o(a1,a2)}catch(e){__go();return}Promise.resolve(__r).then(function(){setTimeout(__go,30)},function(){__go()});setTimeout(__go,6000);return __r}}((0,(_||(_=t(18123))).useGetSubmitActionCallback)(ze,{loggingCommand:null,loggingViewName:Me,parentLoggingViewName:Be.loggingViewName,route:mn,serverState:bn,setState:Sn,trackingInfo:Ne,transitionState:wn})),');
   if (process.env.LICDBG && /nrdjs/.test(fname)) { try{ require('fs').writeFileSync('/tmp/nrdjs_dump.js', code); }catch{} }
   if (/nrdjs/.test(fname)) {
+    if (limit720) {
+      try { code = resolution.patchPlayer(code); }
+      catch (e) { console.error('[video]', e.message); return false; }
+    }
     if (process.env.MARK) {
       code = code.replace('t.onLoad=function(e,t,i,n,r,s,a,o,u,l){', 't.onLoad=function(e,t,i,n,r,s,a,o,u,l){globalThis.__mark("[MARK] onLoad reason="+e.reason+" status="+e.statusCode+" json="+(e.json&&e.json.length)+" fmt="+t);');
       code = code.replace('S=b.response;b.error,t(b.error,S,S.body)', 'S=b.response;globalThis.__mark("[MARK] netjs cb error="+(b.error&&(b.error.error&&b.error.error.message||b.error.message))+" status="+S.statusCode);b.error,t(b.error,S,S.body)');
@@ -88,7 +96,7 @@ function loadChunk(fname, url) {
     if (process.env.MANIFESTREQ) { const mr='i(e);var s=e.viewableIds;e.viewableIds=void 0;'; if (code.includes(mr)) code = code.replace(mr,'globalThis.__mark("[MANIFESTREQ]",JSON.stringify(e));'+mr); else console.log('[host] AVISO: patch MANIFESTREQ nao aplicou'); }
     if (process.env.ASEHIGH !== '0') {
       const dt='defaultThroughput:["defaultThroughput",1537]'; if (code.includes(dt)) code = code.replace(dt,'defaultThroughput:["defaultThroughput",30000]'); else console.log('[host] AVISO: patch defaultThroughput nao aplicou');
-      const mv='minInitVideoBitrate:["minInitVideoBitrate",-1/0]'; if (code.includes(mv)) code = code.replace(mv,'minInitVideoBitrate:["minInitVideoBitrate",2500]'); else console.log('[host] AVISO: patch minInitVideoBitrate nao aplicou');
+      if (!limit720) { const mv='minInitVideoBitrate:["minInitVideoBitrate",-1/0]'; if (code.includes(mv)) code = code.replace(mv,'minInitVideoBitrate:["minInitVideoBitrate",2500]'); else console.log('[host] AVISO: patch minInitVideoBitrate nao aplicou'); }
     }
     if (process.env.LICCACHE !== '1') { const n0 = (code.match(/\b[\w$]+(?:\.A)?\.useLicenseCache\b/g) || []).length; code = code.replace(/\b[\w$]+(?:\.A)?\.useLicenseCache\b/g, '(!1)'); code = code.replace('useLicenseCache:[["uselc","useLicenseCache"],!0]','useLicenseCache:[["uselc","useLicenseCache"],!1]'); console.log('[host] LICCACHE off:', n0, 'leituras'); }
     if (process.env.KODIID !== '0') {
@@ -618,6 +626,7 @@ if (label==='darwinBootstrap.js') { Object.defineProperty(nrdpReal.gibbon.Widget
     get(){ return this.__ts; }, set(v){ if (v && typeof v==='object') this.__ts = Object.assign({}, this.__ts||{}, v); else this.__ts = v; } }); }
 if (label==='darwinBootstrap.js') { const WP=nrdpReal.gibbon.Widget.prototype; for (const a of ['minWidth','minHeight','maxWidth','maxHeight','layoutSpacing','padding']) Object.defineProperty(WP, a, { configurable:true, enumerable:true, get(){ return this.__p[a]; }, set(v){ this.__p[a]=v; } }); }
 const sandbox = {};
+sandbox.__limitVideoResolution = resolution.limitManifest;
 sandbox.globalThis = sandbox; sandbox.self = sandbox; sandbox.window = sandbox; sandbox.global = sandbox;
 sandbox.nrdp = nrdp;
 if (!process.env.NOBOOTURL) nrdpReal.bootURL = 'http://localcontrol.netflix.com/js/boot.js';

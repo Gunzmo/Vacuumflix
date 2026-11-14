@@ -59,8 +59,30 @@ Building on an immutable distro such as Bazzite has not been tested; use a `dist
 
 <!-- coderabbit-ai-generated-section:v1:6c6f18855a3d24b07d2cc39344c22a1941accee893e450b74d066dc5c2955887 -->
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:8e998c2e318030008c42e808730d41e3e4065c343ac0ccee4bd23f19443b6a1f -->
+
+## Limit playback resolution
+
+Set `VACUUMFLIX_MAX_RESOLUTION=720` to select Netflix video streams up to
+1280×720. Lower resolutions remain available for adaptive playback. If a video
+track has no eligible stream, playback reports an error instead of selecting a
+higher resolution. Unset the variable to use the normal limit (up to 1080p).
+
+```sh
+VACUUMFLIX_MAX_RESOLUTION=720 ./netflix
+# Flatpak:
+flatpak run --env=VACUUMFLIX_MAX_RESOLUTION=720 io.vacuumflix.Vacuumflix
+```
+
+This limits the downloaded video rendition; it does not resize the UI. The limit
+is applied to the bundled Netflix player and depends on its manifest format.
+
 ## GPU acceleration
 
+
+<!-- /coderabbit-ai-generated:v1 -->
 The UI, animations, video scaling and video colour conversion use OpenGL ES 3.
 Video frames stay in planar YUV until the GPU shader draws them, reducing frame
 transfer size from four bytes per pixel to approximately 1.5. The CPU still runs
