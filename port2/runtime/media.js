@@ -167,6 +167,10 @@ module.exports = function make(ctx) {
       }
       function spawnSeg() {
         const sg = segs[si];
+        // An init header describes the track but contains no decodable packets.
+        // Wait for samples; replaced/ended empty tracks must not reach FFmpeg.
+        const hasInput = kind !== 'video' || (sg.raw ? sg.chunks.length > (sg.resumeFed || 0) : sg.hasMedia);
+        if (!hasInput) { if (sg.closed) sg.skip = true; return false; }
         if (kind === 'audio' && !audioGate(sg)) { setTimeout(() => { if (!dead && !proc) advance(); }, 40); return false; }
         const RE = kind === 'video' ? [] : ['-re'];
         const hw = kind === 'video' && !sg.raw && !software ? videoAcceleration() : null;
@@ -210,6 +214,7 @@ module.exports = function make(ctx) {
         me.on('close', (code, sig) => { mlog('ffmpeg exit', kind, si, code, sig || '', 'closed=' + !!sg.closed, 'fed=' + fed + '/' + sg.chunks.length); if (proc !== me) return; proc = null;
           if (!dead && hw && hw.enabled && code !== 0) {
             console.error('[gpu] FFmpeg VA-API failed (exit=' + code + ', signal=' + (sig || 'none') + '):\n' + (ffError.trim() || 'No FFmpeg error output'));
+            console.error('[gpu] Input: chunks=' + sg.chunks.length + ', fed=' + fed + ', frames=' + outN + ', closed=' + !!sg.closed);
             if (hw.required) {
               console.error('[gpu] VA-API is required; stopping playback without software fallback');
               killPipe(); setState(ST.STOPPED); return;
@@ -280,6 +285,7 @@ module.exports = function make(ctx) {
                   if (fi) mlog('vdec-frag', 'samples=' + fi.samples, 'frames=' + gotN, 'tfdt=' + fi.tfdt, 'ts=' + sg.ts, 'dur=' + (fi.samples / (sg.fps || fps())).toFixed(3) + 's', 'perdidos=' + (fi.samples - gotN));
                 } else {
                   if (sg.enc) { const r = await cdmb().call(cdmb().OP.DECRYPT, [trackKey, data]); if (r.status === 0) d = r.rets[0]; else mlog('DECRYPT falhou', String(r.rets[0])); }
+                  if (fragInfo(d).samples > 0) sg.hasMedia = true;
                   sg.chunks.push(fixSdi(d));
                 }
               }

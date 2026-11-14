@@ -3,7 +3,7 @@ const cp = require('child_process'), fs = require('fs');
 
 if (process.argv[2] !== 'worker') {
   const { test } = require('node:test');
-  for (const mode of ['clear', 'widevine', 'rgba', 'retry', 'retry-partial', 'required-fail', 'required-unavailable', 'gpu-success']) {
+  for (const mode of ['clear', 'widevine', 'rgba', 'retry', 'retry-partial', 'required-fail', 'required-unavailable', 'gpu-success', 'init-switch', 'init-only-eos']) {
     test('video pipeline: ' + mode, () => {
       const result = cp.spawnSync(process.execPath, [__filename, 'worker', mode], { encoding: 'utf8', timeout: 12000 });
       assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -24,6 +24,10 @@ if (process.argv[2] !== 'worker') {
     while (mp4.toString('ascii', boundary + 4, boundary + 8) !== 'moof') boundary += mp4.readUInt32BE(boundary);
     const init = Buffer.from(mp4.subarray(0, boundary)), frag = mp4.subarray(boundary);
     let attempts = 0;
+    let decoderSpawns = 0; const events = [];
+    if (mode.startsWith('init-')) {
+      const spawn = cp.spawn; cp.spawn = (...args) => { decoderSpawns++; return spawn(...args); };
+    }
     if (mode.startsWith('retry') || mode.startsWith('required') || mode === 'gpu-success') {
       const gpu = require('../runtime/gpu');
       gpu.videoAcceleration = () => ({ required: mode.startsWith('required'), enabled: mode !== 'required-unavailable', env: process.env, input: ['-threads', '1', '-hwaccel', 'vaapi'] });
@@ -56,16 +60,28 @@ if (process.argv[2] !== 'worker') {
         return { status: 0, rets: [Buffer.concat(Array.from({ length: count }, () => Buffer.concat([header, plane]))), Buffer.from('8,8')] };
       };
     }
-    const media = require('../runtime/media')({ mlog() {}, mono: Date.now, logProxy(_, obj) { obj.emit = () => {}; obj.addListener = () => {}; return obj; } });
+    const media = require('../runtime/media')({ mlog() {}, mono: Date.now, logProxy(_, obj) { obj.emit = (event) => events.push(event); obj.addListener = () => {}; return obj; } });
     const player = await new Promise(resolve => media.factory.createPlayer(process.pid, r => resolve(r.player)));
     const sid = media.base.createMediaSource(null, player.path).sourceid;
     const bid = media.base.createSourceBuffers(sid, [1]).bufferids[0];
     media.base.attachDataToSourceBuffer(init, sid, bid);
-    media.base.attachDataToSourceBuffer(frag, sid, bid); media.base.endOfStream(bid);
+    if (!mode.startsWith('init-')) { media.base.attachDataToSourceBuffer(frag, sid, bid); media.base.endOfStream(bid); }
     player.open({ videoAttributes: { frameRateValue: 24 } }); player.play();
     const file = '/dev/shm/gibbon_video_' + process.pid + '.rgba';
     try {
       const start = Date.now(); let frame;
+      if (mode.startsWith('init-')) {
+        await new Promise(r => setTimeout(r, 100));
+        assert.equal(decoderSpawns, 0, 'initialization alone must not launch a decoder');
+        if (mode === 'init-only-eos') {
+          media.base.endOfStream(bid); player.__feed();
+          await new Promise(r => setTimeout(r, 50));
+          assert.equal(decoderSpawns, 0); assert(events.includes('endofstream')); return;
+        }
+        const nextInit = Buffer.from(init); nextInit.writeUInt32BE(init.readUInt32BE(12) + 1, 12);
+        media.base.attachDataToSourceBuffer(nextInit, sid, bid);
+        media.base.attachDataToSourceBuffer(frag, sid, bid); media.base.endOfStream(bid); player.__feed();
+      }
       if (mode.startsWith('required')) {
         while (player.state !== player.STOPPED && Date.now() - start < 5000) await new Promise(r => setTimeout(r, 20));
         assert.equal(player.state, player.STOPPED); assert.equal(attempts, mode === 'required-fail' ? 1 : 0);
@@ -80,6 +96,7 @@ if (process.argv[2] !== 'worker') {
       assert.equal(frame.length, 12 + (mode === 'rgba' ? w*h*4 : frameSize));
       if (mode === 'widevine') assert.equal(frame[12], 81, 'Widevine planar pixels pass through unchanged');
       if (mode.startsWith('retry')) assert.equal(attempts, 1);
+      if (mode === 'init-switch') assert.equal(decoderSpawns, 1);
       console.log(mode + ' passed');
     } finally {
       media.closeAll(); for (const suffix of ['', '.last', '.tmp']) { try { fs.unlinkSync(file + suffix); } catch {} }
