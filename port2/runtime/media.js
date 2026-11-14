@@ -1,4 +1,6 @@
 const https = require('https'), http = require('http'), fs = require('fs'), path = require('path');
+const { videoAcceleration } = require('./gpu');
+const GPU_VIDEO = process.env.VACUUMFLIX_GPU_VIDEO !== '0';
 const DUMP = process.env.MEDIADUMP || null;
 if (DUMP) fs.mkdirSync(DUMP, { recursive: true });
 const agent = { 'https:': new https.Agent({ keepAlive: true, maxSockets: 8 }), 'http:': new http.Agent({ keepAlive: true, maxSockets: 8 }) };
@@ -152,7 +154,7 @@ module.exports = function make(ctx) {
     function prEnqueue(st, sz, frame, pts, src, rel, sess) { pr.st.in++; pr.src = src; pr.srcs.add(src); pr.q.push({ st, sz, frame, pts, sess }); if (pr.q.length >= 6) { try { src.stdout.pause(); } catch {} } prRun(); }
 
     function makeChain(b, kind, st) {
-      const segs = []; let cursor = 0, cur = null, si = 0, proc = null, fed = 0, dead = false, done = false, waitDrain = false;
+      const segs = []; let cursor = 0, cur = null, si = 0, proc = null, fed = 0, dead = false, done = false, waitDrain = false, software = false;
       const c = { kind, kill() { dead = true; if (proc) { try { proc.kill('SIGKILL'); } catch {} } }, signal(sg) { if (proc) try { proc.kill(sg); } catch {} }, get done() { return done; } };
       function audioGate(sg) {
         const now = Date.now(); sg.gateT0 = sg.gateT0 || now;
@@ -167,24 +169,40 @@ module.exports = function make(ctx) {
         const sg = segs[si];
         if (kind === 'audio' && !audioGate(sg)) { setTimeout(() => { if (!dead && !proc) advance(); }, 40); return false; }
         const RE = kind === 'video' ? [] : ['-re'];
+        const hw = kind === 'video' && !sg.raw && !software ? videoAcceleration() : null;
         const args = sg.raw ? ['-hide_banner', '-loglevel', process.env.FFLOGLEVEL || 'error', ...RE, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-video_size', sg.raw.w + 'x' + sg.raw.h, '-framerate', String(fps()), '-i', 'pipe:0']
-                            : ['-hide_banner', '-loglevel', 'error', ...RE, '-f', 'mp4', '-i', 'pipe:0'];
+                            : ['-hide_banner', '-loglevel', 'error', ...RE, ...(hw ? hw.input : []), '-f', 'mp4', '-i', 'pipe:0'];
         let sz = null;
-        if (kind === 'video') { sz = sg.raw || mp4Size(sg.chunks[0]); if (!sz) { sg.skip = true; return false; } if (!sg.raw) args.push('-map', '0:v:0'); args.push('-pix_fmt', 'rgba', '-f', 'rawvideo', 'pipe:1'); }
+        if (kind === 'video') {
+          sz = sg.raw || mp4Size(sg.chunks[0]); if (!sz) { sg.skip = true; return false; }
+          if (!sg.raw) {
+            args.push('-map', '0:v:0');
+            const filters = hw && hw.enabled ? ['hwdownload', 'format=nv12'] : [];
+            // Normalize stream metadata to the matrix/range used by the shader.
+            if (GPU_VIDEO) filters.push('scale=out_color_matrix=' + (sz.h > 576 ? 'bt709' : 'bt601') + ':out_range=tv', 'format=yuv420p');
+            if (filters.length) args.push('-vf', filters.join(','));
+          }
+          if (sg.raw && GPU_VIDEO) args.push('-c:v', 'copy');
+          args.push('-pix_fmt', GPU_VIDEO ? 'yuv420p' : 'rgba', '-f', 'rawvideo', 'pipe:1');
+        }
         else args.push('-vn', '-ac', '2', '-ar', '48000', '-f', 'pulse', '-name', 'Netflix', '-stream_name', 'Netflix', '-buffer_duration', '100', 'Netflix');
         mlog('ffmpeg', kind, 'seg', si, sz);
-        proc = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'] }); waitDrain = false; fed = sg.resumeFed || 0; sg.resumeFed = 0; const base = fed; let outN = 0;
+        proc = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'], env: hw ? hw.env : process.env }); waitDrain = false; fed = sg.resumeFed || 0; sg.resumeFed = 0; const base = fed; let outN = 0;
         const me = proc; CHILDREN.add(me); me.on('exit', () => CHILDREN.delete(me));
         me.stderr.on('data', d => { if (process.env.MEDIALOG && process.env.FFLOG) console.log('[ffmpeg ' + kind + ']', String(d).trim().slice(0, 200)); });
         me.stdin.on('error', (e) => { mlog('ffmpeg stdin erro', kind, si, e && e.code, e && e.message, 'pendente=' + me.stdin.writableLength); }); me.stdin.on('close', () => { mlog('ffmpeg stdin fechou', kind, si, 'destruido=' + me.stdin.destroyed, 'pendente=' + me.stdin.writableLength, 'fed=' + fed); });
         if (kind === 'video') {
-          const fsz = sz.w * sz.h * 4; let off = 0; const pool = []; let cur = Buffer.allocUnsafe(fsz);
+          const fsz = GPU_VIDEO ? sz.w * sz.h + 2 * Math.ceil(sz.w / 2) * Math.ceil(sz.h / 2) : sz.w * sz.h * 4; let off = 0; const pool = []; let cur = Buffer.allocUnsafe(fsz);
           const rel = (b) => { if (b.length === fsz && pool.length < 4) pool.push(b); };
           me.stdout.on('data', d => { let o = 0;
             while (o < d.length) { const n = Math.min(fsz - off, d.length - o); d.copy(cur, off, o, o + n); off += n; o += n;
-              if (off === fsz) { outN++; if (sg.raw) sg.chunks[base + outN - 1] = null; if (sg.t0 === undefined) sg.t0 = (pr.nextPts !== undefined ? pr.nextPts : 0); const fp = sg.fps || fps(), pts = sg.t0 + (sg.fn = (sg.fn || 0) + 1, sg.fn - 1) / fp; pr.nextPts = pts + 1 / fp; let sess; if (sg.fmap && sg.fmap.length) { const fn0 = sg.fn - 1; if (sg.fk === undefined) sg.fk = 0; while (sg.fk + 1 < sg.fmap.length && sg.fmap[sg.fk + 1].start <= fn0) sg.fk++; const fm = sg.fmap[sg.fk]; sess = fm.sess0 + (fn0 - fm.start) / fp; } prEnqueue(st, sz, cur, pts, me, rel, sess); cur = pool.pop() || Buffer.allocUnsafe(fsz); off = 0; } } });
+              if (off === fsz) { outN++; if (outN <= (sg.replayFrames || 0)) { off = 0; continue; } if (sg.raw) sg.chunks[base + outN - 1] = null; if (sg.t0 === undefined) sg.t0 = (pr.nextPts !== undefined ? pr.nextPts : 0); const fp = sg.fps || fps(), pts = sg.t0 + (sg.fn = (sg.fn || 0) + 1, sg.fn - 1) / fp; pr.nextPts = pts + 1 / fp; let sess; if (sg.fmap && sg.fmap.length) { const fn0 = sg.fn - 1; if (sg.fk === undefined) sg.fk = 0; while (sg.fk + 1 < sg.fmap.length && sg.fmap[sg.fk + 1].start <= fn0) sg.fk++; const fm = sg.fmap[sg.fk]; sess = fm.sess0 + (fn0 - fm.start) / fp; } prEnqueue(st, sz, cur, pts, me, rel, sess); cur = pool.pop() || Buffer.allocUnsafe(fsz); off = 0; } } });
         }
-        me.on('exit', (code, sig) => { mlog('ffmpeg exit', kind, si, code, sig || '', 'closed=' + !!sg.closed, 'fed=' + fed + '/' + sg.chunks.length); if (proc !== me) return; proc = null;
+        me.on('close', (code, sig) => { mlog('ffmpeg exit', kind, si, code, sig || '', 'closed=' + !!sg.closed, 'fed=' + fed + '/' + sg.chunks.length); if (proc !== me) return; proc = null;
+          if (!dead && hw && hw.enabled && code !== 0) {
+            console.warn('[gpu] VA-API decoding failed; retrying this stream in software');
+            software = true; sg.replayFrames = outN; advance(); return;
+          }
           if (kind === 'video' && sg.raw && !sg.closed && !dead && (sg.respawns = (sg.respawns || 0) + 1) <= 20) { sg.resumeFed = base + outN; mlog('ffmpeg video: saida precoce, retomando o segmento', si, 'respawn', sg.respawns, 'quadros reenviados', fed - (base + outN)); advance(); return; }
           si++; if (!dead) advance(); });
         return true;
@@ -270,7 +288,9 @@ module.exports = function make(ctx) {
         onFrame(sz, frame, relMs, absPts, sessPts) {
           if (!pipe || pipe.st !== st) return;
           if (rebase && typeof absPts === 'number' && absPts > 0) { startPts = Math.round(absPts * 1000) - (relMs || 0); rebase = false; mlog('player.rebase startPts=' + startPts); }
-          const hdr = Buffer.alloc(12); hdr.writeUInt32LE(sz.w, 0); hdr.writeUInt32LE(sz.h, 4); hdr.writeUInt32LE(++seq, 8);
+          const hdr = Buffer.alloc(12); // High bits identify planar I420 and its colour matrix; old RGBA files remain readable.
+          const format = GPU_VIDEO ? (0x80000000 | (sz.h > 576 ? 0x40000000 : 0)) : 0;
+          hdr.writeUInt32LE((sz.w | format) >>> 0, 0); hdr.writeUInt32LE(sz.h, 4); hdr.writeUInt32LE(++seq, 8);
           try { const fd = fs.openSync(frameFile + '.tmp', 'w'); fs.writeSync(fd, hdr); fs.writeSync(fd, frame, 0, frame.length); fs.closeSync(fd); fs.renameSync(frameFile + '.tmp', frameFile); } catch {}
           frames++; const posMs = (typeof sessPts === 'number' && isFinite(sessPts)) ? Math.round(sessPts * 1000) : startPts + (relMs !== undefined ? relMs : Math.round(frames * 1000 / fpsv)); base.__curPts = posMs; const now = Date.now();
           if (now - lastEmit >= 200) { lastEmit = now; if (process.env.MEDIALOG && now - (globalThis.__ptsLogT || 0) > 2000) { globalThis.__ptsLogT = now; mlog('updatepts', posMs, 'sessao=' + (typeof sessPts === 'number')); } base.emit('updatepts', { type: 'updatepts', pts: posMs, time: mono() }); }

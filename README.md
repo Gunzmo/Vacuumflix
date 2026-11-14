@@ -55,8 +55,81 @@ sudo pacman -S git base-devel sdl2 nodejs ffmpeg curl python-pillow xz noto-font
 
 Building on an immutable distro such as Bazzite has not been tested; use a `distrobox` container if you try.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:6c6f18855a3d24b07d2cc39344c22a1941accee893e450b74d066dc5c2955887 -->
+
+## GPU acceleration
+
+The UI, animations, video scaling and video colour conversion use OpenGL ES 3.
+Video frames stay in planar YUV until the GPU shader draws them, reducing frame
+transfer size from four bytes per pixel to approximately 1.5. The CPU still runs
+application logic, image/text loading, audio and DRM.
+
+VA-API decoding is enabled automatically for video decoded by FFmpeg. The app
+tries available `/dev/dri/renderD*` devices, uses libva's selected driver, and
+tries `i965` if automatic driver initialization fails. An unsupported codec or
+decoder error retries the stream in software without replaying displayed frames.
+Protected Netflix video currently uses Widevine's software decoder; it benefits
+from GPU presentation but cannot use VA-API decoding through that CDM interface.
+Widevine L3 and the existing playback quality limits are unchanged.
+
+### Legacy Intel (i965/libva)
+
+Install your distribution's **i965 VA-API driver** on the build machine to include
+`i965_drv_video.so` and its dependencies in the package. On Debian/Ubuntu this is
+`i965-va-driver`; on Arch it is `libva-intel-driver`. An FFmpeg build with VA-API
+support and an OpenGL ES 3 driver are also required. Host/runtime drivers are
+searched before the bundled fallback. Flatpak already grants GPU device access;
+its runtime Intel VA-API extension can also supply the driver.
+
+Force legacy Intel for a standalone install:
+
+```sh
+LIBVA_DRIVER_NAME=i965 ./netflix
+```
+
+Or for Flatpak:
+
+```sh
+flatpak run --env=LIBVA_DRIVER_NAME=i965 io.vacuumflix.Vacuumflix
+```
+
+Options (also accepted with Flatpak's `--env=NAME=value`):
+
+- `VACUUMFLIX_HWACCEL=auto` (default) or `vaapi`: try VA-API, then software.
+- `VACUUMFLIX_HWACCEL=off`: software decoding with GPU presentation.
+- `VACUUMFLIX_VAAPI_DEVICE=/dev/dri/renderD128`: select a specific GPU.
+- `LIBVA_DRIVER_NAME` and `LIBVA_DRIVERS_PATH`: standard libva overrides, preserved.
+- `VACUUMFLIX_GPU_VIDEO=0`: use the original RGBA conversion path for diagnostics.
+
+Startup logs show the OpenGL vendor/renderer and selected VA-API device/driver.
+`llvmpipe` or `softpipe` in the renderer means Mesa is rendering on the CPU: check
+your system's graphics driver and GPU permissions. `vainfo` with
+`LIBVA_DRIVER_NAME=i965` can check which codecs your hardware supports.
+The planar shader uses limited-range BT.709 for HD and BT.601 for SD; FFmpeg
+normalizes clear streams to that format, and Widevine's I420 output is assumed
+to use those TV colour conventions. Frames still pass through system memory;
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cf95f2d46f0eeef01e4d79611d9ff201f577e73375a0b8e928941abcea434602 -->
+
+this is not a zero-copy DMA-BUF pipeline.
+
+### Development checks
+
+Run `./port2/tests/run_gpu.sh` with Node, FFmpeg (including libx264), GCC, SDL2
+and GLES development files installed. It checks driver selection and video
+fallbacks, and renders test pixels through the actual shader using SDL's
+offscreen Mesa backend. Physical i965 decoding still needs an Intel GPU;
+these tests can run with Mesa software rendering.
+
+
+<!-- /coderabbit-ai-generated:v1 -->
 ## Disclaimer
 
+
+<!-- /coderabbit-ai-generated:v1 -->
 Vacuumflix is an unofficial client. It is not affiliated with, endorsed or supported by Netflix, Inc. "Netflix" is a trademark of Netflix, Inc.
 
 - A valid Netflix subscription is required. Vacuumflix does not provide, unlock or bypass access to any content.
