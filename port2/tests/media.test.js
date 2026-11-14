@@ -3,10 +3,12 @@ const cp = require('child_process'), fs = require('fs');
 
 if (process.argv[2] !== 'worker') {
   const { test } = require('node:test');
-  for (const mode of ['clear', 'widevine', 'rgba', 'retry', 'retry-partial']) {
+  for (const mode of ['clear', 'widevine', 'rgba', 'retry', 'retry-partial', 'required-fail', 'required-unavailable', 'gpu-success']) {
     test('video pipeline: ' + mode, () => {
       const result = cp.spawnSync(process.execPath, [__filename, 'worker', mode], { encoding: 'utf8', timeout: 12000 });
       assert.equal(result.status, 0, result.stdout + result.stderr);
+      if (mode === 'required-fail') { assert.match(result.stderr, /synthetic VA-API failure/); assert.match(result.stderr, /without software fallback/); }
+      if (mode === 'gpu-success') assert.match(result.stdout, /FFmpeg VA-API produced video frames/);
     });
   }
 } else {
@@ -22,16 +24,24 @@ if (process.argv[2] !== 'worker') {
     while (mp4.toString('ascii', boundary + 4, boundary + 8) !== 'moof') boundary += mp4.readUInt32BE(boundary);
     const init = Buffer.from(mp4.subarray(0, boundary)), frag = mp4.subarray(boundary);
     let attempts = 0;
-    if (mode.startsWith('retry')) {
+    if (mode.startsWith('retry') || mode.startsWith('required') || mode === 'gpu-success') {
       const gpu = require('../runtime/gpu');
-      gpu.videoAcceleration = () => ({ enabled: true, env: process.env, input: ['-hwaccel', 'vaapi'] });
+      gpu.videoAcceleration = () => ({ required: mode.startsWith('required'), enabled: mode !== 'required-unavailable', env: process.env, input: ['-threads', '1', '-hwaccel', 'vaapi'] });
       const spawn = cp.spawn;
       cp.spawn = (bin, args, opts) => {
         if (args.includes('-hwaccel')) {
           attempts++;
+          if (mode === 'gpu-success') {
+            assert(args.indexOf('-hwaccel') < args.indexOf('-i'));
+            assert(args.includes('-threads'));
+            const cpuArgs = [...args]; cpuArgs.splice(cpuArgs.indexOf('-threads'), 4); // synthetic hardware options
+            const vf = cpuArgs.indexOf('-vf'); cpuArgs[vf+1] = cpuArgs[vf+1].replace('hwdownload,format=nv12,', '');
+            return spawn(bin, cpuArgs, opts); // no real GPU in CI: exercise successful output handling
+          }
           // Reproduce both initialization failure and failure after one frame.
-          return spawn(process.execPath, ['-e', mode === 'retry-partial' ? `process.stdout.write(Buffer.alloc(${frameSize})); process.exitCode=1` : 'process.exit(1)'], opts);
+          return spawn(process.execPath, ['-e', mode === 'retry-partial' ? `process.stdout.write(Buffer.alloc(${frameSize})); process.exitCode=1` : "console.error('synthetic VA-API failure'); process.exit(1)"], opts);
         }
+        assert(!mode.startsWith('required'), 'required mode must never spawn a software decoder');
         return spawn(bin, args, opts);
       };
     }
@@ -56,6 +66,11 @@ if (process.argv[2] !== 'worker') {
     const file = '/dev/shm/gibbon_video_' + process.pid + '.rgba';
     try {
       const start = Date.now(); let frame;
+      if (mode.startsWith('required')) {
+        while (player.state !== player.STOPPED && Date.now() - start < 5000) await new Promise(r => setTimeout(r, 20));
+        assert.equal(player.state, player.STOPPED); assert.equal(attempts, mode === 'required-fail' ? 1 : 0);
+        assert(!fs.existsSync(file)); return;
+      }
       while (Date.now() - start < 7000) {
         try { frame = fs.readFileSync(file); if (frame.readUInt32LE(8) === count) break; } catch {}
         await new Promise(r => setTimeout(r, 20));

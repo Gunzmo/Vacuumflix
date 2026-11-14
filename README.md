@@ -97,7 +97,21 @@ flatpak run --env=LIBVA_DRIVER_NAME=i965 io.vacuumflix.Vacuumflix
 
 Options (also accepted with Flatpak's `--env=NAME=value`):
 
-- `VACUUMFLIX_HWACCEL=auto` (default) or `vaapi`: try VA-API, then software.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cbeeff17c9ab399a7bd9153187e6ee5667fd41aa3e0a944ae21e8caf91bd60a2 -->
+
+- `VACUUMFLIX_HWACCEL=auto` (default): try VA-API, then software.
+- `VACUUMFLIX_HWACCEL=vaapi`: require VA-API for FFmpeg video decoding; stop playback
+  with the FFmpeg error if hardware initialization or decoding fails. This mode
+  now forbids the software fallback that earlier versions allowed. It does not
+  replace Widevine's own decoder. For legacy Intel, run
+  `LIBVA_DRIVER_NAME=i965 VACUUMFLIX_HWACCEL=vaapi ./netflix` (or pass both variables
+  with Flatpak's `--env=` option). Hardware decoding uses one decoder thread to
+  limit surface demand. A successful device probe confirms initialization only;
+  the app logs when FFmpeg actually produces video frames through VA-API.
+
+<!-- /coderabbit-ai-generated:v1 -->
 - `VACUUMFLIX_HWACCEL=off`: software decoding with GPU presentation.
 - `VACUUMFLIX_VAAPI_DEVICE=/dev/dri/renderD128`: select a specific GPU.
 - `LIBVA_DRIVER_NAME` and `LIBVA_DRIVERS_PATH`: standard libva overrides, preserved.

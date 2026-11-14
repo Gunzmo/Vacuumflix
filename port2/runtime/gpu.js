@@ -18,8 +18,8 @@ function driverEnvironment(env = process.env) {
 let selected;
 function videoAcceleration() {
   if (selected) return selected;
-  selected = { input: [], env: driverEnvironment(), enabled: false };
   const mode = process.env.VACUUMFLIX_HWACCEL || 'auto';
+  selected = { input: [], env: driverEnvironment(), enabled: false, required: mode === 'vaapi' };
   if (mode === 'off') return selected;
   if (!['auto', 'vaapi'].includes(mode)) {
     console.warn('[gpu] Unknown VACUUMFLIX_HWACCEL; using software decoding');
@@ -34,14 +34,15 @@ function videoAcceleration() {
       const env = { ...selected.env };
       if (driver) env.LIBVA_DRIVER_NAME = driver;
       const probe = cp.spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-init_hw_device', 'vaapi=gpu:' + device,
-        '-f', 'lavfi', '-i', 'nullsrc=s=16x16', '-frames:v', '1', '-f', 'null', '-'], { env, timeout: 3000, stdio: 'ignore' });
-      if (probe.status !== 0) continue;
+        '-f', 'lavfi', '-i', 'nullsrc=s=16x16', '-frames:v', '1', '-f', 'null', '-'], { env, timeout: 3000, maxBuffer: 8192, encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'] });
+      if (probe.status !== 0) { selected.error = String(probe.stderr || (probe.error && probe.error.message) || 'Device initialization failed').trim().slice(-4096); continue; }
       console.log('[gpu] VA-API device=' + device + ' driver=' + (driver || 'auto'));
-      selected = { enabled: true, env, input: ['-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi'] };
+      // Bound the decoder's surface demand on legacy Intel drivers.
+      selected = { enabled: true, required: mode === 'vaapi', env, input: ['-threads', '1', '-hwaccel', 'vaapi', '-hwaccel_device', device, '-hwaccel_output_format', 'vaapi'] };
       return selected;
     }
   }
-  console.warn('[gpu] VA-API unavailable; using software decoding with GPU video presentation');
+  if (!selected.required) console.warn('[gpu] VA-API unavailable; using software decoding with GPU video presentation');
   return selected;
 }
 

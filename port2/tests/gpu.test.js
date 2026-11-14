@@ -27,7 +27,7 @@ test('tries i965 after libva auto fails, preserving other environment', () => {
   assert.equal(calls.length, 2); assert.equal(result.enabled, true);
   assert.equal(result.env.LIBVA_DRIVER_NAME, 'i965'); assert.equal(result.env.CUSTOM, 'preserved');
   assert.equal(result.env.LIBVA_DRIVERS_PATH, '/usr/lib/dri:/package/sys/lib/dri');
-  assert.deepEqual(result.input, ['-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128', '-hwaccel_output_format', 'vaapi']);
+  assert.deepEqual(result.input, ['-threads', '1', '-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128', '-hwaccel_output_format', 'vaapi']);
 });
 test('explicit device and libva overrides are respected', () => {
   const { result, calls } = run({ VACUUMFLIX_VAAPI_DEVICE: '/dev/dri/renderD129', LIBVA_DRIVER_NAME: 'iHD', LIBVA_DRIVERS_PATH: '/custom' }, ['renderD128'], () => 0);
@@ -38,4 +38,11 @@ test('failed devices fall back; later render nodes are tried', () => {
   assert.equal(run({}, ['renderD128'], () => 1).result.enabled, false);
   const { result, calls } = run({}, ['renderD128', 'renderD129'], (_, a) => a.includes('vaapi=gpu:/dev/dri/renderD129') ? 0 : 1);
   assert.equal(result.enabled, true); assert.equal(calls.length, 3);
+});
+
+test('explicit vaapi mode requires hardware even if initialization fails', () => {
+  const failed = run({ VACUUMFLIX_HWACCEL: 'vaapi' }, [], () => 1).result;
+  assert.equal(failed.required, true); assert.equal(failed.enabled, false);
+  const ok = run({ VACUUMFLIX_HWACCEL: 'vaapi' }, ['renderD128'], () => 0).result;
+  assert.equal(ok.required, true); assert.equal(ok.enabled, true);
 });

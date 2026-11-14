@@ -170,6 +170,10 @@ module.exports = function make(ctx) {
         if (kind === 'audio' && !audioGate(sg)) { setTimeout(() => { if (!dead && !proc) advance(); }, 40); return false; }
         const RE = kind === 'video' ? [] : ['-re'];
         const hw = kind === 'video' && !sg.raw && !software ? videoAcceleration() : null;
+        if (hw && hw.required && !hw.enabled) {
+          console.error('[gpu] VA-API is required but unavailable: ' + (hw.error || 'No usable render device'));
+          killPipe(); setState(ST.STOPPED); return false;
+        }
         const args = sg.raw ? ['-hide_banner', '-loglevel', process.env.FFLOGLEVEL || 'error', ...RE, '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-video_size', sg.raw.w + 'x' + sg.raw.h, '-framerate', String(fps()), '-i', 'pipe:0']
                             : ['-hide_banner', '-loglevel', 'error', ...RE, ...(hw ? hw.input : []), '-f', 'mp4', '-i', 'pipe:0'];
         let sz = null;
@@ -189,17 +193,27 @@ module.exports = function make(ctx) {
         mlog('ffmpeg', kind, 'seg', si, sz);
         proc = cp.spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'pipe'], env: hw ? hw.env : process.env }); waitDrain = false; fed = sg.resumeFed || 0; sg.resumeFed = 0; const base = fed; let outN = 0;
         const me = proc; CHILDREN.add(me); me.on('exit', () => CHILDREN.delete(me));
-        me.stderr.on('data', d => { if (process.env.MEDIALOG && process.env.FFLOG) console.log('[ffmpeg ' + kind + ']', String(d).trim().slice(0, 200)); });
+        let ffError = '';
+        me.on('error', e => { ffError = (ffError + '\n' + e.message).slice(-4096); });
+        me.stderr.on('data', d => {
+          ffError = (ffError + String(d)).slice(-4096);
+          if (process.env.MEDIALOG && process.env.FFLOG) console.log('[ffmpeg ' + kind + ']', String(d).trim());
+        });
         me.stdin.on('error', (e) => { mlog('ffmpeg stdin erro', kind, si, e && e.code, e && e.message, 'pendente=' + me.stdin.writableLength); }); me.stdin.on('close', () => { mlog('ffmpeg stdin fechou', kind, si, 'destruido=' + me.stdin.destroyed, 'pendente=' + me.stdin.writableLength, 'fed=' + fed); });
         if (kind === 'video') {
           const fsz = GPU_VIDEO ? sz.w * sz.h + 2 * Math.ceil(sz.w / 2) * Math.ceil(sz.h / 2) : sz.w * sz.h * 4; let off = 0; const pool = []; let cur = Buffer.allocUnsafe(fsz);
           const rel = (b) => { if (b.length === fsz && pool.length < 4) pool.push(b); };
           me.stdout.on('data', d => { let o = 0;
             while (o < d.length) { const n = Math.min(fsz - off, d.length - o); d.copy(cur, off, o, o + n); off += n; o += n;
-              if (off === fsz) { outN++; if (outN <= (sg.replayFrames || 0)) { off = 0; continue; } if (sg.raw) sg.chunks[base + outN - 1] = null; if (sg.t0 === undefined) sg.t0 = (pr.nextPts !== undefined ? pr.nextPts : 0); const fp = sg.fps || fps(), pts = sg.t0 + (sg.fn = (sg.fn || 0) + 1, sg.fn - 1) / fp; pr.nextPts = pts + 1 / fp; let sess; if (sg.fmap && sg.fmap.length) { const fn0 = sg.fn - 1; if (sg.fk === undefined) sg.fk = 0; while (sg.fk + 1 < sg.fmap.length && sg.fmap[sg.fk + 1].start <= fn0) sg.fk++; const fm = sg.fmap[sg.fk]; sess = fm.sess0 + (fn0 - fm.start) / fp; } prEnqueue(st, sz, cur, pts, me, rel, sess); cur = pool.pop() || Buffer.allocUnsafe(fsz); off = 0; } } });
+              if (off === fsz) { outN++; if (outN === 1 && hw && hw.enabled) console.log('[gpu] FFmpeg VA-API produced video frames'); if (outN <= (sg.replayFrames || 0)) { off = 0; continue; } if (sg.raw) sg.chunks[base + outN - 1] = null; if (sg.t0 === undefined) sg.t0 = (pr.nextPts !== undefined ? pr.nextPts : 0); const fp = sg.fps || fps(), pts = sg.t0 + (sg.fn = (sg.fn || 0) + 1, sg.fn - 1) / fp; pr.nextPts = pts + 1 / fp; let sess; if (sg.fmap && sg.fmap.length) { const fn0 = sg.fn - 1; if (sg.fk === undefined) sg.fk = 0; while (sg.fk + 1 < sg.fmap.length && sg.fmap[sg.fk + 1].start <= fn0) sg.fk++; const fm = sg.fmap[sg.fk]; sess = fm.sess0 + (fn0 - fm.start) / fp; } prEnqueue(st, sz, cur, pts, me, rel, sess); cur = pool.pop() || Buffer.allocUnsafe(fsz); off = 0; } } });
         }
         me.on('close', (code, sig) => { mlog('ffmpeg exit', kind, si, code, sig || '', 'closed=' + !!sg.closed, 'fed=' + fed + '/' + sg.chunks.length); if (proc !== me) return; proc = null;
           if (!dead && hw && hw.enabled && code !== 0) {
+            console.error('[gpu] FFmpeg VA-API failed (exit=' + code + ', signal=' + (sig || 'none') + '):\n' + (ffError.trim() || 'No FFmpeg error output'));
+            if (hw.required) {
+              console.error('[gpu] VA-API is required; stopping playback without software fallback');
+              killPipe(); setState(ST.STOPPED); return;
+            }
             console.warn('[gpu] VA-API decoding failed; retrying this stream in software');
             software = true; sg.replayFrames = outN; advance(); return;
           }
