@@ -1,5 +1,7 @@
 <!-- coderabbit-ai-generated:v1 -->
 
+<!-- coderabbit-ai-generated-section:v1:072ae5131ca233cb62eafcaa46b924070839d4f5992fb2a3bc8f16ff8d152a92 -->
+
 <!-- coderabbit-ai-generated-section:v1:0fd9f8760939fdda5702921eceabc4a17969305349445e5823c02af9f883248d -->
 
 # Vacuumflix
@@ -129,7 +131,9 @@ the 30-second network stall timeout. Cancelling playback also cancels retries.
 
 
 
-<!-- /coderabbit-ai-generated:v1 -->`VACUUMFLIX_CACHE_DIR` selects the cache directory. The default is
+<!-- /coderabbit-ai-generated:v1 -->
+
+`VACUUMFLIX_CACHE_DIR` selects the cache directory. The default is
 `$XDG_CACHE_HOME/vacuumflix/decrypted-mp4`, or
 `~/.cache/vacuumflix/decrypted-mp4`. Only one app instance can own a cache
 directory at a time. Use a disk directory writable by the application; Flatpak
