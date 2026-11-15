@@ -109,3 +109,69 @@ test('cached real fragmented MP4 decodes identically to its source', async t => 
   const decoded = cp.spawnSync('ffmpeg', ['-v', 'error', '-i', path.join(directory, files(directory)[0]), '-pix_fmt', 'yuv420p', '-f', 'rawvideo', 'pipe:1']);
   assert.equal(decoded.status, 0, String(decoded.stderr)); assert.equal(decoded.stdout.length, 8 * 16 * 16 * 1.5); lease.release();
 });
+
+test('retries interrupted HTTP downloads from a fresh header without leaking quota or partial data', async t => {
+  const data = fakeMp4(200); let calls = 0;
+  const { cache, url, directory } = await fixture(t, (_, res) => {
+    calls++; res.writeHead(200, { 'Content-Length': data.length });
+    if (calls === 1) { res.write(data.subarray(0, 100)); setTimeout(() => res.destroy(), 10); }
+    else res.end(data);
+  }, 200);
+  const logs = []; cache.log = msg => logs.push(msg);
+  const lease = await cache.acquire(url);
+  assert.equal(calls, 2); assert.deepEqual(lease.read(), data); assert.equal(cache.bytes, 200);
+  assert.deepEqual(files(directory).map(f => f.slice(-4)), ['.mp4']);
+  assert(logs.some(msg => /interrupted at 100\/200 bytes.*ECONNRESET.*restarting/.test(msg)));
+  lease.release();
+});
+
+test('replacement reader waits for cancelled download cleanup before starting the same URL', async t => {
+  const data = fakeMp4(100); let calls = 0, started;
+  const ready = new Promise(r => { started = r; });
+  const { cache, url } = await fixture(t, (_, res) => {
+    calls++; res.writeHead(200, { 'Content-Length': data.length });
+    if (calls === 1) { res.write(data.subarray(0, 50)); started(); } else res.end(data);
+  }, 100);
+  const controller = new AbortController();
+  const first = cache.acquire(url, { signal: controller.signal });
+  await ready; controller.abort(); await assert.rejects(first, { name: 'AbortError' });
+  const replacement = await cache.acquire(url);
+  assert.deepEqual(replacement.read(), data); assert.equal(calls, 2); assert.equal(cache.bytes, 100); replacement.release();
+});
+
+test('paused HTTP reads do not time out during slow downstream preparation', async t => {
+  const data = fakeMp4(100); let finish;
+  const { cache, url } = await fixture(t, (_, res) => {
+    res.writeHead(200, { 'Content-Length': data.length }); res.write(data.subarray(0, 50));
+    finish = () => res.end(data.subarray(50));
+  });
+  cache.requestTimeoutMs = 30;
+  const res = await cache.response(url, new AbortController().signal);
+  let error; res.on('error', e => { error = e; });
+  res.pause(); await delay(100); assert.equal(error, undefined); assert.equal(res.destroyed, false);
+  finish(); const chunks = []; for await (const chunk of res) chunks.push(chunk);
+  assert.deepEqual(Buffer.concat(chunks), data);
+});
+
+test('network retry limit is bounded and cancellation during retry backoff stops new downloads', async t => {
+  let calls = 0;
+  const { cache, url, directory } = await fixture(t, (_, res) => {
+    calls++; res.writeHead(200, { 'Content-Length': 100 }); res.write(fakeMp4(100).subarray(0, 50)); setTimeout(() => res.destroy(), 5);
+  });
+  await assert.rejects(cache.acquire(url), /interrupted.*ECONNRESET/); assert.equal(calls, 3);
+  assert.equal(cache.bytes, 0); assert.deepEqual(files(directory), []);
+  const controller = new AbortController();
+  cache.log = msg => { if (msg.includes('restarting')) controller.abort(); };
+  await assert.rejects(cache.acquire(url, { signal: controller.signal }), { name: 'AbortError' });
+  await delay(300); assert.equal(calls, 4); assert.equal(cache.bytes, 0); assert.deepEqual(files(directory), []);
+});
+
+test('unpaused network stalls still time out and exhaust only the bounded retries', async t => {
+  let calls = 0;
+  const { cache, url, directory } = await fixture(t, (_, res) => {
+    calls++; res.writeHead(200, { 'Content-Length': 100 }); res.flushHeaders();
+  });
+  cache.requestTimeoutMs = 30;
+  await assert.rejects(cache.acquire(url), /interrupted.*ETIMEDOUT.*stalled/);
+  assert.equal(calls, 3); assert.equal(cache.bytes, 0); assert.deepEqual(files(directory), []);
+});

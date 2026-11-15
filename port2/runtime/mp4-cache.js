@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const http = require('node:http'), https = require('node:https');
 const { pipeline } = require('node:stream/promises');
 const { Transform } = require('node:stream');
+const { setTimeout: delay } = require('node:timers/promises');
 
 const MAX_BYTES = 10_000_000_000; // Combined video, audio and incomplete downloads: 10 GB.
 const ACTIVE = new Set();
@@ -13,9 +14,10 @@ process.on('exit', () => { for (const cache of ACTIVE) cache.close(); });
 const abortError = () => Object.assign(new Error('MP4 cache request cancelled'), { name: 'AbortError' });
 
 class Mp4Cache {
-  constructor({ directory = process.env.VACUUMFLIX_CACHE_DIR || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'vacuumflix', 'decrypted-mp4'), maxBytes = MAX_BYTES, log = () => {} } = {}) {
+  constructor({ directory = process.env.VACUUMFLIX_CACHE_DIR || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'vacuumflix', 'decrypted-mp4'), maxBytes = MAX_BYTES, requestTimeoutMs = 30000, log = () => {} } = {}) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_BYTES) throw new Error('MP4 cache limit must be at most 10 GB');
-    this.directory = directory; this.maxBytes = maxBytes; this.log = log;
+    if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs <= 0) throw new Error('Invalid MP4 download timeout');
+    this.directory = directory; this.maxBytes = maxBytes; this.log = log; this.requestTimeoutMs = requestTimeoutMs;
     this.entries = new Map(); this.jobs = new Map(); this.bytes = 0; this.closed = false;
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     // One owner per directory keeps the combined limit valid across app instances.
@@ -65,6 +67,12 @@ class Mp4Cache {
     if (signal?.aborted) throw abortError();
     const key = crypto.createHash('sha256').update(url).digest('hex');
     let job = this.jobs.get(key), entry = this.entries.get(key);
+    // A replacement reader must not join the cancelled job still cleaning up its file.
+    while (job?.controller.signal.aborted) {
+      await job.promise.catch(() => {});
+      if (this.closed || signal?.aborted) throw abortError();
+      job = this.jobs.get(key); entry = this.entries.get(key);
+    }
     if (!entry) {
       if (!job) {
         job = { controller: new AbortController(), waiters: new Set(), reserved: 0 };
@@ -109,29 +117,53 @@ class Mp4Cache {
     const u = new URL(url);
     if (!['http:', 'https:'].includes(u.protocol)) throw new Error('Unsupported MP4 URL protocol');
     const res = await new Promise((resolve, reject) => {
-      const req = (u.protocol === 'https:' ? https : http).get(u, { signal, headers: { 'Accept-Encoding': 'identity' } }, resolve);
-      req.setTimeout(30000, () => req.destroy(new Error('MP4 cache download stalled')));
+      let activeResponse;
+      const req = (u.protocol === 'https:' ? https : http).get(u, { signal, headers: { 'Accept-Encoding': 'identity' } }, response => {
+        activeResponse = response;
+        // CPU-bound CDM preparation applies backpressure. Paused reads are not a network stall.
+        response.on('pause', () => req.setTimeout(0));
+        response.on('resume', () => req.setTimeout(this.requestTimeoutMs));
+        resolve(response);
+      });
+      req.setTimeout(this.requestTimeoutMs, () => {
+        const error = Object.assign(new Error('MP4 cache download stalled'), { code: 'ETIMEDOUT' });
+        activeResponse?.destroy(error); req.destroy(error);
+      });
       req.on('error', reject);
     });
     if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-      res.resume();
+      res.destroy();
       if (!res.headers.location || redirects >= 5) throw new Error('MP4 cache redirect limit exceeded');
       return this.response(new URL(res.headers.location, url).href, signal, redirects + 1);
     }
-    if (res.statusCode !== 200) { res.resume(); throw new Error('MP4 cache requires a complete HTTP 200 response (received ' + res.statusCode + ')'); }
+    if (res.statusCode !== 200) { res.destroy(); throw new Error('MP4 cache requires a complete HTTP 200 response (received ' + res.statusCode + ')'); }
     return res;
   }
 
   async download(url, key, job) {
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.downloadAttempt(url, key, job); }
+      catch (e) {
+        if (this.closed || job.controller.signal.aborted) throw abortError();
+        const transient = ['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(e.code);
+        if (!transient || attempt >= 2) throw e;
+        // Restart from the header: never splice responses or reuse partially decrypted data.
+        this.log(e.message + '; restarting MP4 download (' + (attempt + 1) + '/2)');
+        await delay(250 * (attempt + 1), undefined, { signal: job.controller.signal });
+      }
+    }
+  }
+
+  async downloadAttempt(url, key, job) {
     const partial = path.join(this.directory, key + '.part'), file = path.join(this.directory, key + '.mp4');
-    let res;
+    let res, size = 0, total = null;
     try {
       res = await this.response(url, job.controller.signal);
       const declared = res.headers['content-length'];
-      const total = declared === undefined ? null : Number(declared);
+      total = declared === undefined ? null : Number(declared);
       if (total !== null && (!Number.isSafeInteger(total) || total < 12)) throw new Error('Invalid MP4 content length');
       if (total !== null) this.reserve(total, job);
-      let size = 0, prefix = Buffer.alloc(0), lastLog = 0;
+      let prefix = Buffer.alloc(0), lastLog = 0;
       const meter = new Transform({ transform: (chunk, _, callback) => {
         try {
           if (this.closed) throw abortError();
@@ -152,7 +184,11 @@ class Mp4Cache {
       this.entries.set(key, entry); this.bytes -= job.reserved - size; job.reserved = 0;
       this.log('Decrypted MP4 ready: ' + Math.round(size / 1e6) + ' MB'); return entry;
     } catch (e) {
-      res?.destroy(); fs.rmSync(partial, { force: true }); this.bytes -= job.reserved; job.reserved = 0; throw e;
+      res?.destroy(); fs.rmSync(partial, { force: true }); this.bytes -= job.reserved; job.reserved = 0;
+      if (!job.controller.signal.aborted && ['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(e.code)) {
+        e.message = 'MP4 download interrupted at ' + size + (total === null ? '' : '/' + total) + ' bytes (' + e.code + '): ' + e.message;
+      }
+      throw e;
     }
   }
 

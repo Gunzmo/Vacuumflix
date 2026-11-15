@@ -117,10 +117,19 @@ The combined cache limit is **10 GB (10,000,000,000 bytes)**, including audio,
 video and incomplete downloads. Unused files are evicted first. If the active
 renditions cannot fit, preparation fails; choose a smaller rendition such as
 720p. Downloads require a server that supplies complete MP4 files with HTTP 200.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:918c2288479f44839360068d7fb013fe1c83f79c726a9c22f8597c3777d4c5f1 -->
+
 A rendition switch may require another complete download. Preparation logs appear
 with `[cache]`; startup can take as long as downloading and decrypting the title.
+Interrupted connections and network stalls retry at most twice, restarting the
+complete download and decryption. Reads paused by decryption do not count toward
+the 30-second network stall timeout. Cancelling playback also cancels retries.
 
-`VACUUMFLIX_CACHE_DIR` selects the cache directory. The default is
+
+
+<!-- /coderabbit-ai-generated:v1 -->`VACUUMFLIX_CACHE_DIR` selects the cache directory. The default is
 `$XDG_CACHE_HOME/vacuumflix/decrypted-mp4`, or
 `~/.cache/vacuumflix/decrypted-mp4`. Only one app instance can own a cache
 directory at a time. Use a disk directory writable by the application; Flatpak
