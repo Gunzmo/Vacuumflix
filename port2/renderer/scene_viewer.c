@@ -80,8 +80,9 @@ static double g_now_ms=0; static int g_anim_seen=0;
 static double ease_in(int fam,double t){ switch(fam){ case 1: return 1.0-cos(t*M_PI/2); case 2: return t*t; case 3: return t*t*t; case 4: return t*t*t*t; case 5: return t*t*t*t*t; case 6: return t==0?0:pow(2,10*t-10); case 7: return 1.0-sqrt(1.0-t*t); case 8: { double c1=1.70158; return (c1+1)*t*t*t-c1*t*t; } default: return t; } }
 static double ease_apply(int mode,int fam,double t){ if(mode==0) return ease_in(fam,t); if(mode==1) return 1.0-ease_in(fam,1.0-t); return t<0.5? ease_in(fam,2*t)/2 : 1.0-ease_in(fam,2-2*t)/2; }
 static GLuint prog,vao,vbo,uRect,uView,uColor;
+static GLuint uTYUV,uTU,uTV;
 static GLuint tprog,uTRect,uTView,uTAlpha,uTSamp,uTUV,uCUV,uTSize,uTRad,uTFade,uTQuad,uTClip,uTClipRad;
-typedef struct { char*path; GLuint tex; int w,h; time_t tried; int band; int bandb; } Tex;
+typedef struct { char*path; GLuint tex; int w,h; time_t tried; GLuint u,v; int yuv; int band; int bandb; } Tex;
 #define MAXTEX 2048
 static Tex texs[MAXTEX]; static int ntex=0;
 
@@ -152,10 +153,21 @@ static Tex* tex_get(const char*path){
 
 typedef struct { char path[400]; Tex t; unsigned seq; int nb, bandmin, keep, pos, zero; int tmin,bmin,tpos,bpos,tz,bz,keepb; int rt[48], rb[48], ri, rn; } Vid;
 
-static int black_rows(const unsigned char*px,int w,int h,int fromTop){
+// I420 keeps colour conversion in the fragment shader. Bit 31 marks I420,
+// bit 30 selects BT.709 (HD); legacy RGBA frame files have neither bit set.
+static int black_rows(const unsigned char*px,int w,int h,int fromTop,int yuv){
     int lim=h*22/100, t=0;
-    for(;t<lim;t++){ const unsigned char*r=fromTop?px+(size_t)t*w*4:px+(size_t)(h-1-t)*w*4; int br=0; for(int x=0;x<w*4;x+=64){ if(r[x]+r[x+1]+r[x+2]>60){br=1;break;} } if(br) break; }
+    for(;t<lim;t++){ const unsigned char*r=px+(size_t)(fromTop?t:h-1-t)*w*(yuv?1:4); int br=0;
+        for(int x=0;x<w;x+=16){ if(yuv?r[x]>36:r[x*4]+r[x*4+1]+r[x*4+2]>60){br=1;break;} } if(br) break; }
     return t>=lim?-1:t; }
+static void video_plane(GLuint*tex,int w,int h,const unsigned char*px,int resize){
+    if(!*tex){ glGenTextures(1,tex); resize=1; glBindTexture(GL_TEXTURE_2D,*tex);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE); }
+    glBindTexture(GL_TEXTURE_2D,*tex);
+    if(resize) glTexImage2D(GL_TEXTURE_2D,0,GL_R8,w,h,0,GL_RED,GL_UNSIGNED_BYTE,px);
+    else glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w,h,GL_RED,GL_UNSIGNED_BYTE,px);
+}
 static Vid vids[4]; static int nvids=0;
 static Tex* vid_get(const char*path){
     Vid*v=NULL; for(int i=0;i<nvids;i++) if(!strcmp(vids[i].path,path)) v=&vids[i];
@@ -163,19 +175,34 @@ static Tex* vid_get(const char*path){
     FILE*f=fopen(path,"rb"); if(!f){ v->seq=0; v->nb=0; v->pos=0; v->zero=0; v->bandmin=100000; v->t.band=0; v->t.bandb=0; v->tmin=v->bmin=100000; v->tpos=v->bpos=v->tz=v->bz=0; v->rn=0; v->ri=0; return NULL; } unsigned int hdr[3];
     { char*dot=strstr(v->path,".rgba.last"); if(dot){ char base[400]; snprintf(base,sizeof base,"%s",v->path); base[dot-v->path+5]=0; for(int i=0;i<nvids;i++) if(!strcmp(vids[i].path,base)) { v->t.band=vids[i].keep; v->t.bandb=vids[i].keepb; } } }
     if(fread(hdr,4,3,f)!=3){ fclose(f); return v->t.tex?&v->t:NULL; }
+    int yuv=(hdr[0]&0x80000000u)?((hdr[0]&0x40000000u)?2:1):0; hdr[0]&=0x3fffffffu;
     if(hdr[2]!=v->seq && hdr[0]>0 && hdr[1]>0 && hdr[0]<8192 && hdr[1]<8192){
-        size_t n=(size_t)hdr[0]*hdr[1]*4; unsigned char*px=malloc(n);
+        size_t yn=(size_t)hdr[0]*hdr[1], cn=(size_t)((hdr[0]+1)/2)*((hdr[1]+1)/2);
+        size_t n=yuv?yn+2*cn:yn*4; unsigned char*px=malloc(n);
         if(hdr[2]<v->seq){ v->nb=0; v->pos=0; v->zero=0; v->bandmin=100000; v->t.band=0; v->t.bandb=0; v->tmin=v->bmin=100000; v->tpos=v->bpos=v->tz=v->bz=0; v->rn=0; v->ri=0; }
         if(px && fread(px,1,n,f)==n){
-            if(!strstr(v->path,".last")){ int tb=black_rows(px,hdr[0],hdr[1],1), bb=black_rows(px,hdr[0],hdr[1],0);
+            if(!strstr(v->path,".last")){ int tb=black_rows(px,hdr[0],hdr[1],1,yuv), bb=black_rows(px,hdr[0],hdr[1],0,yuv);
               if(tb<0) tb=0; if(bb<0) bb=0;
               v->rt[v->ri]=tb; v->rb[v->ri]=bb; v->ri=(v->ri+1)%48; if(v->rn<48) v->rn++; if(v->nb<1000000) v->nb++;
               { int ct=0,zt=0,mt=0,cb=0,zb=0,mb=0; for(int q=0;q<v->rn;q++){ int a1=v->rt[q], b1=v->rb[q]; if(a1>=3){ ct++; if(!mt||a1<mt) mt=a1; } else zt++; if(b1>=3){ cb++; if(!mb||b1<mb) mb=b1; } else zb++; }
 
                 v->t.band=(v->rn>=8 && ct>4*zt)?mt:0; v->t.bandb=(v->rn>=8 && cb>4*zb)?mb:0; if(getenv("VIEWDBG")){ static int dd=0; if((dd++%40)==0) fprintf(stderr,"[bands] rn=%d top: bar=%d sem=%d min=%d | base: bar=%d sem=%d min=%d -> band=%d bandb=%d\n",v->rn,ct,zt,mt,cb,zb,mb,v->t.band,v->t.bandb); } }
               if(v->t.band>0||v->t.bandb>0){ v->keep=v->t.band; v->keepb=v->t.bandb; } }
-            if(!v->t.tex){ glGenTextures(1,&v->t.tex); glBindTexture(GL_TEXTURE_2D,v->t.tex); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE); }
-            glBindTexture(GL_TEXTURE_2D,v->t.tex); glPixelStorei(GL_UNPACK_ALIGNMENT,1); glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,hdr[0],hdr[1],0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+            glActiveTexture(GL_TEXTURE0); glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+            int resize=v->t.w!=(int)hdr[0] || v->t.h!=(int)hdr[1] || !!v->t.yuv!=!!yuv;
+            if(yuv){
+                video_plane(&v->t.tex,hdr[0],hdr[1],px,resize);
+                video_plane(&v->t.u,(hdr[0]+1)/2,(hdr[1]+1)/2,px+yn,resize);
+                video_plane(&v->t.v,(hdr[0]+1)/2,(hdr[1]+1)/2,px+yn+cn,resize);
+            } else {
+                if(!v->t.tex) glGenTextures(1,&v->t.tex);
+                glBindTexture(GL_TEXTURE_2D,v->t.tex);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                if(resize) glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,hdr[0],hdr[1],0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+                else glTexSubImage2D(GL_TEXTURE_2D,0,0,0,hdr[0],hdr[1],GL_RGBA,GL_UNSIGNED_BYTE,px);
+            }
+            v->t.yuv=yuv;
             v->t.w=hdr[0]; v->t.h=hdr[1]; v->seq=hdr[2]; }
         free(px); }
     fclose(f); return v->t.tex?&v->t:NULL; }
@@ -198,8 +225,10 @@ static const char* RFS=
 " o=c*cov*uAlpha; }\n";
 static const char* TFS=
 "#version 300 es\n"
-"precision highp float; uniform sampler2D uTex; uniform float uAlpha; uniform vec2 uSize; uniform float uRad,uFade,uClipRad; uniform vec4 uQuad,uClip; in vec2 vUV; in vec2 vPos; out vec4 o;\n"
-"void main(){ vec4 c=texture(uTex,vUV); float a=c.a*uAlpha;\n"
+"precision highp float; uniform sampler2D uTex,uU,uV; uniform int uYUV; uniform float uAlpha; uniform vec2 uSize; uniform float uRad,uFade,uClipRad; uniform vec4 uQuad,uClip; in vec2 vUV; in vec2 vPos; out vec4 o;\n"
+"void main(){ vec4 c=texture(uTex,vUV);\n"
+" if(uYUV>0){ float y=(c.r-16.0/255.0)*255.0/219.0; float u=texture(uU,vUV).r-128.0/255.0; float v=texture(uV,vUV).r-128.0/255.0;\n"
+"   vec3 rgb=uYUV==2?vec3(y+1.792741*v,y-0.213249*u-0.532909*v,y+2.112402*u):vec3(y+1.596027*v,y-0.391762*u-0.812968*v,y+2.017232*u); c=vec4(clamp(rgb,0.0,1.0),1.0); } float a=c.a*uAlpha;\n"
 " if(uFade>0.0){ float f=clamp((1.0-vPos.y)/uFade,0.0,1.0); a*=f*f*(3.0-2.0*f); }\n"
 " if(uRad>0.0){ vec2 p=(vPos-0.5)*uSize; vec2 b=uSize*0.5; float r=min(uRad,min(b.x,b.y)); vec2 q=abs(p)-b+r; float d=length(max(q,0.0))+min(max(q.x,q.y),0.0)-r; a*=clamp(0.5-d,0.0,1.0); }\n"
 " if(uClipRad>0.0){ vec2 pp=uQuad.xy+vPos*uQuad.zw; vec2 b=uClip.zw*0.5; float r=min(uClipRad,min(b.x,b.y)); vec2 q=abs(pp-(uClip.xy+b))-b+r; float d=length(max(q,0.0))+min(max(q.x,q.y),0.0)-r; a*=clamp(0.5-d,0.0,1.0); }\n"
@@ -210,7 +239,7 @@ static GLuint compile(GLenum t,const char*s){ GLuint sh=glCreateShader(t); glSha
 static void gl_init(void){ GLuint vs=compile(GL_VERTEX_SHADER,VS),fs=compile(GL_FRAGMENT_SHADER,FS);
     prog=glCreateProgram(); glAttachShader(prog,vs); glAttachShader(prog,fs); glLinkProgram(prog);
     { GLuint tf=compile(GL_FRAGMENT_SHADER,TFS); tprog=glCreateProgram(); glAttachShader(tprog,vs); glAttachShader(tprog,tf); glLinkProgram(tprog);
-      uTRect=glGetUniformLocation(tprog,"uRect"); uTView=glGetUniformLocation(tprog,"uView"); uTAlpha=glGetUniformLocation(tprog,"uAlpha"); uTSamp=glGetUniformLocation(tprog,"uTex"); uTUV=glGetUniformLocation(tprog,"uUV"); uTSize=glGetUniformLocation(tprog,"uSize"); uTRad=glGetUniformLocation(tprog,"uRad"); uTFade=glGetUniformLocation(tprog,"uFade"); uTQuad=glGetUniformLocation(tprog,"uQuad"); uTClip=glGetUniformLocation(tprog,"uClip"); uTClipRad=glGetUniformLocation(tprog,"uClipRad"); if(getenv("VIEWDBG")) fprintf(stderr,"[vdbg] uniform locs rect=%d view=%d alpha=%d samp=%d uv=%d size=%d rad=%d fade=%d\n",(int)uTRect,(int)uTView,(int)uTAlpha,(int)uTSamp,(int)uTUV,(int)uTSize,(int)uTRad,(int)uTFade); }
+      uTYUV=glGetUniformLocation(tprog,"uYUV"); uTU=glGetUniformLocation(tprog,"uU"); uTV=glGetUniformLocation(tprog,"uV"); uTRect=glGetUniformLocation(tprog,"uRect"); uTView=glGetUniformLocation(tprog,"uView"); uTAlpha=glGetUniformLocation(tprog,"uAlpha"); uTSamp=glGetUniformLocation(tprog,"uTex"); uTUV=glGetUniformLocation(tprog,"uUV"); uTSize=glGetUniformLocation(tprog,"uSize"); uTRad=glGetUniformLocation(tprog,"uRad"); uTFade=glGetUniformLocation(tprog,"uFade"); uTQuad=glGetUniformLocation(tprog,"uQuad"); uTClip=glGetUniformLocation(tprog,"uClip"); uTClipRad=glGetUniformLocation(tprog,"uClipRad"); if(getenv("VIEWDBG")) fprintf(stderr,"[vdbg] uniform locs rect=%d view=%d alpha=%d samp=%d uv=%d size=%d rad=%d fade=%d\n",(int)uTRect,(int)uTView,(int)uTAlpha,(int)uTSamp,(int)uTUV,(int)uTSize,(int)uTRad,(int)uTFade); }
     { GLuint rf=compile(GL_FRAGMENT_SHADER,RFS); rprog=glCreateProgram(); glAttachShader(rprog,vs); glAttachShader(rprog,rf); glLinkProgram(rprog);
       uRRect=glGetUniformLocation(rprog,"uRect"); uRView=glGetUniformLocation(rprog,"uView"); uRUV=glGetUniformLocation(rprog,"uUV"); uRSize=glGetUniformLocation(rprog,"uSize");
       uRSh=glGetUniformLocation(rprog,"uSh"); uRRad=glGetUniformLocation(rprog,"uRad"); uRSW=glGetUniformLocation(rprog,"uSW"); uRSC=glGetUniformLocation(rprog,"uSC"); uRFill=glGetUniformLocation(rprog,"uFill");
@@ -243,11 +272,12 @@ static void draw(Widget*wd,float ox,float oy,float ps,float po,int vw,int vh){
         glUniform1f(uRRad,wd->cr*sc); glUniform2f(uRSh,0,0); glUniform1f(uRSW,0); float z4[4]={0,0,0,0}; float f4[4]={r,g,b,a/(op>0?op:1)}; glUniform4fv(uRSC,1,z4); glUniform4fv(uRFill,1,f4); glUniform1i(uRGOn,0); glUniform4fv(uRGrad,1,z4); glUniform1i(uRN,1); glUniform1f(uRAlpha,op); glDrawArrays(GL_TRIANGLE_STRIP,0,4); }
     else if(a>0.001f){ glUseProgram(prog); glBindVertexArray(vao); glUniform4f(uRect,px,py,w,h); glUniform4f(uCUV,0,0,1,1); glUniform2f(uView,vw,vh); glUniform4f(uColor,r,g,b,a); glDrawArrays(GL_TRIANGLE_STRIP,0,4); }
     for(int i=0;i<wd->nitems;i++){ Tex*t=wd->kinds[i]=='M'?vid_get(wd->items[i]):tex_get(wd->items[i]); if(!t) continue; if(wd->kinds[i]=='M' && wd->ia[i]>0.01f) g_vidnow=1;
-        glUseProgram(tprog); glUniform1f(uTClipRad,0.f); glBindVertexArray(vao); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,t->tex); glUniform1i(uTSamp,0);
+        glUseProgram(tprog); glUniform1f(uTClipRad,0.f); glBindVertexArray(vao); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,t->tex); glUniform1i(uTSamp,0); glUniform1i(uTYUV,t->yuv);
+        if(t->yuv){ glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,t->u); glUniform1i(uTU,1); glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D,t->v); glUniform1i(uTV,2); glActiveTexture(GL_TEXTURE0); }
         float iw=wd->kinds[i]=='T'?t->w:w, ih=wd->kinds[i]=='T'?t->h:h; if(wd->kinds[i]=='T'){ iw*=sc; ih*=sc; }
         int vflag2=(wd->kinds[i]=='M'&&wd->uv[i][0]<-1.5f);     int nocrop=(wd->kinds[i]=='M'&&wd->uv[i][0]<0.f&&!vflag2);     float bf=(wd->kinds[i]=='M'&&!nocrop&&t->h>0)?(float)t->band/t->h:0.f, bbf=(wd->kinds[i]=='M'&&!nocrop&&t->h>0)?(float)t->bandb/t->h:0.f; int hasb=(bf>0.f||bbf>0.f); int vscis=0; float rx=px, ry=py; if(wd->kinds[i]=='M'&&!nocrop&&t->w>0&&t->h>0){   float cw=(float)t->w, ch=(float)t->h*(1.f-bf-bbf); int fullw=(w>=0.9f*vw); float RX=fullw?0.f:px, RY=fullw?0.f:py, RW=fullw?(float)vw:w, RH=fullw?(float)vh:h; int fitw=fullw&&!vflag2; float s=fitw?(RW/cw):fmaxf(RW/cw,RH/ch); iw=cw*s; ih=ch*s; rx=RX+(RW-iw)*0.5f; ry=fitw?RY:(RY+(RH-ih)*0.5f);
 
-          if(!fullw && g_dh>0){ float sx=(float)g_dw/vw, sy=(float)g_dh/vh; glEnable(GL_SCISSOR_TEST); glScissor((int)(px*sx),(int)(g_dh-(py+h)*sy),(int)(w*sx),(int)(h*sy)); vscis=1; } } glUniform4f(uTRect,rx,ry,iw,ih); if(wd->kinds[i]=='M') glUniform4f(uTUV,0.f,bf,1.f,1.f-bf-bbf);     else if(nocrop) glUniform4f(uTUV,0.f,0.f,1.f,1.f); else glUniform4f(uTUV,wd->uv[i][0],wd->uv[i][1],wd->uv[i][2],wd->uv[i][3]); glUniform2f(uTView,vw,vh); glUniform1f(uTAlpha,op*(wd->kinds[i]=='M'?wd->ia[i]:1.f)); glUniform2f(uTSize,iw,ih); glUniform1f(uTRad,wd->kinds[i]=='T'?0.f:wd->cr*sc); glUniform4f(uTQuad,rx,ry,iw,ih); glUniform4f(uTClip,px,py,w,h); glUniform1f(uTClipRad,(wd->kinds[i]=='M'&&wd->cr>0.f)?wd->cr*sc:0.f);     { float ff=0.f; if(wd->kinds[i]=='M'&&!nocrop&&ih>0.f){ int covers=(rx<=1.f && ry<=1.f && rx+iw>=(float)vw-1.f && ry+ih>=(float)vh-1.f); ff=(vscis||vflag2||covers)?0.f:(hasb?1.0f:0.6f);                 } if(wd->kinds[i]=='M'&&getenv("VIEWFADE")) ff=(float)atof(getenv("VIEWFADE")); glUniform1f(uTFade,ff); if(getenv("VIEWDBG")&&wd->kinds[i]=='M'){ static int dn=0; if((dn++%30)==0) fprintf(stderr,"[vdbg] %s py=%.1f ih=%.1f h=%.1f vh=%d band=%d bandb=%d nocrop=%d ff=%.3f op=%.2f\n",wd->items[i],(double)py,(double)ih,(double)h,vh,t->band,t->bandb,nocrop,(double)ff,(double)op); } } glDrawArrays(GL_TRIANGLE_STRIP,0,4); glUniform1f(uTFade,0.f); if(vscis) glDisable(GL_SCISSOR_TEST); }
+          if(!fullw && g_dh>0){ float sx=(float)g_dw/vw, sy=(float)g_dh/vh; glEnable(GL_SCISSOR_TEST); glScissor((int)(px*sx),(int)(g_dh-(py+h)*sy),(int)(w*sx),(int)(h*sy)); vscis=1; } } glUniform4f(uTRect,rx,ry,iw,ih); if(wd->kinds[i]=='M') glUniform4f(uTUV,0.f,bf,1.f,1.f-bf-bbf);     else if(nocrop) glUniform4f(uTUV,0.f,0.f,1.f,1.f); else glUniform4f(uTUV,wd->uv[i][0],wd->uv[i][1],wd->uv[i][2],wd->uv[i][3]); glUniform2f(uTView,vw,vh); glUniform1f(uTAlpha,op*(wd->kinds[i]=='M'?wd->ia[i]:1.f)); glUniform2f(uTSize,iw,ih); glUniform1f(uTRad,wd->kinds[i]=='T'?0.f:wd->cr*sc); glUniform4f(uTQuad,rx,ry,iw,ih); glUniform4f(uTClip,px,py,w,h); glUniform1f(uTClipRad,(wd->kinds[i]=='M'&&wd->cr>0.f)?wd->cr*sc:0.f);     { float ff=0.f; if(wd->kinds[i]=='M'&&!nocrop&&ih>0.f){ int covers=(rx<=1.f && ry<=1.f && rx+iw>=(float)vw-1.f && ry+ih>=(float)vh-1.f); ff=(vscis||vflag2||covers)?0.f:(hasb?1.0f:0.6f);                 } if(wd->kinds[i]=='M'&&getenv("VIEWFADE")) ff=(float)atof(getenv("VIEWFADE")); glUniform1f(uTFade,ff); if(getenv("VIEWDBG")&&wd->kinds[i]=='M'){ static int dn=0; if((dn++%30)==0) fprintf(stderr,"[vdbg] %s py=%.1f ih=%.1f h=%.1f vh=%d band=%d bandb=%d nocrop=%d ff=%.3f op=%.2f\n",wd->items[i],(double)py,(double)ih,(double)h,vh,t->band,t->bandb,nocrop,(double)ff,(double)op); } } glDrawArrays(GL_TRIANGLE_STRIP,0,4); glUniform1f(uTFade,0.f); glUniform1i(uTYUV,0); if(vscis) glDisable(GL_SCISSOR_TEST); }
     int clipped=0, pc_on=0, pc[4]={0,0,0,0};
     if(wd->clip && g_dh>0){ float sx=(float)g_dw/vw, sy=(float)g_dh/vh; int X=(int)(px*sx), Y=(int)(g_dh-(py+h)*sy), W_=(int)(w*sx), H_=(int)(h*sy);
         pc_on=g_sc_on; memcpy(pc,g_sc,sizeof pc);
@@ -329,10 +359,14 @@ int main(int argc,char**argv){
     ws_load();
     SDL_Window*win=SDL_CreateWindow("Netflix",
         (ws_x>=0&&ws_y>=0)?ws_x:SDL_WINDOWPOS_CENTERED,(ws_x>=0&&ws_y>=0)?ws_y:SDL_WINDOWPOS_CENTERED,ws_w,ws_h,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
+    if(!win){ fprintf(stderr,"[gpu] SDL window: %s\n",SDL_GetError()); SDL_Quit(); return 1; }
     { const char*ib=getenv("NETFLIX_ICON_BMP"); if(ib){ SDL_Surface*is=SDL_LoadBMP(ib); if(is){ SDL_SetWindowIcon(win,is); SDL_FreeSurface(is); } } }
     if(getenv("NETFLIX_FULLSCREEN")||g_gs()||ws_mode==2) SDL_SetWindowFullscreen(win,SDL_WINDOW_FULLSCREEN_DESKTOP); else if(ws_mode==1) SDL_MaximizeWindow(win);
     SDL_StartTextInput();
-    SDL_GLContext ctx=SDL_GL_CreateContext(win); SDL_GL_SetSwapInterval(1); gl_init();
+    SDL_GLContext ctx=SDL_GL_CreateContext(win);
+    if(!ctx){ fprintf(stderr,"[gpu] OpenGL ES 3 context: %s\n",SDL_GetError()); SDL_DestroyWindow(win); SDL_Quit(); return 1; }
+    fprintf(stderr,"[gpu] UI vendor=%s renderer=%s version=%s\n",glGetString(GL_VENDOR),glGetString(GL_RENDERER),glGetString(GL_VERSION));
+    SDL_GL_SetSwapInterval(1); gl_init();
     printf("[viewer] lendo cena de: %s (hot-reload). ESC/fechar p/ sair.\n", scenefile);
     Widget*scene=NULL; int vw=1920,vh=1080; long long lastm=0;
     { const char*sd=getenv("SPLASH_DIR"); if(sd && !getenv("NOSPLASH")){ snprintf(sp_dir,sizeof sp_dir,"%s",sd); char cp[640]; snprintf(cp,sizeof cp,"%s/count.txt",sd); FILE*cf=fopen(cp,"r"); if(cf){ if(fscanf(cf,"%d",&sp_n)!=1) sp_n=0; sp_total=sp_n; fclose(cf);} } }

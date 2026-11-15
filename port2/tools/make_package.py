@@ -46,8 +46,8 @@ def ldd(path):
 copied = set()
 
 
-def put_lib(name, src):
-    if EXCLUDE.match(name) or name in copied:
+def put_lib(name, src, driver_dependency=False):
+    if (EXCLUDE.match(name) and not driver_dependency) or name in copied:
         return
     shutil.copy2(os.path.realpath(src), os.path.join(LIB, name))
     copied.add(name)
@@ -109,6 +109,27 @@ def compile_native(tmp):
     return viewer, cdmhost
 
 
+def bundle_i965():
+    # libva dlopens this driver, so ldd(ffmpeg) cannot discover it. Keep it
+    # separate from the core libraries so libva can also use host drivers.
+    candidates = []
+    for base in ('/usr/lib', '/usr/lib64', '/usr/local/lib'):
+        candidates += glob.glob(os.path.join(base, 'dri', 'i965_drv_video.so'))
+        candidates += glob.glob(os.path.join(base, '*-linux-gnu', 'dri', 'i965_drv_video.so'))
+    if not candidates:
+        print('warning: i965_drv_video.so not found; install the i965 VA-API driver to bundle legacy Intel support')
+        return
+    dest = os.path.join(LIB, 'dri')
+    os.makedirs(dest, exist_ok=True)
+    driver = os.path.realpath(candidates[0])
+    shutil.copy2(driver, os.path.join(dest, 'i965_drv_video.so'))
+    for name, src in ldd(driver).items():
+        if os.path.exists(src):
+            # This legacy userspace companion may be absent from modern hosts
+            # and Flatpak runtimes; it is required by the bundled i965 plugin.
+            put_lib(name, src, driver_dependency=(name == 'libdrm_intel.so.1'))
+
+
 def main():
     if os.path.exists(OUT):
         shutil.rmtree(OUT)
@@ -132,6 +153,8 @@ def main():
     for name in ('node', 'ffmpeg', 'curl'):
         copy_bin(shutil.which(name) or sys.exit(f'{name} not found on the build machine'), name)
         wrapper(os.path.join(BIN, name), name)
+
+    bundle_i965()
 
     pyv = sh('python3', '-c', 'import sys;print("%d.%d"%sys.version_info[:2])').strip()
     copy_bin(os.path.realpath(shutil.which('python3')), 'python3')
@@ -218,7 +241,7 @@ Run:  ./netflix
 - Nothing to install: node, ffmpeg, python+Pillow, libraries and glibc are included.
 - Needs: Linux x86_64, a video driver with OpenGL ES/EGL (Mesa/NVIDIA), a PulseAudio-compatible sound
   server (PulseAudio or PipeWire), internet access and a writable folder.
-- The login is stored in port2/data/cookies.json (do NOT share it). Delete it to sign out.
+- GPU: OpenGL ES UI and video colour conversion; VA-API decoding when supported.\n- Legacy Intel i965 is bundled when installed on the build host; host drivers take precedence.\n- Set LIBVA_DRIVER_NAME=i965 to select legacy Intel, VACUUMFLIX_HWACCEL=off for software decoding.\n- Protected video is decoded by Widevine in software and presented using the GPU.\n- The login is stored in port2/data/cookies.json (do NOT share it). Delete it to sign out.
 - If the window does not open on Wayland:  SDL_VIDEODRIVER=x11 ./netflix   (or the reverse).
 ''')
     shutil.rmtree(os.path.dirname(viewer))
